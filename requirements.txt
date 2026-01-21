@@ -1,1 +1,15 @@
 geohash2
+langgraph
+kafka
+concurrent
+typing 
+uuid
+torch
+numpy
+pillow
+cv2
+transformers
+librosa
+whisper
+pandas 
+datetime
