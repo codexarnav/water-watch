@@ -124,7 +124,7 @@ def test_signal_stream_with_spike():
     state = create_initial_state()
     
     # Process baseline messages
-    for i in range(15):
+    for i in range(50):
         state = orchestrator.invoke(state, {"recursion_limit": 15})
         time.sleep(0.2)
     

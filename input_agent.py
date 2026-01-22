@@ -737,7 +737,7 @@ def should_continue(state: OrchestratorState) -> str:
     active = state["active_stream"]
     
     if active == "idle":
-        return "wait"
+        return END
     
     # Signal routing
     if active == "signal":
@@ -755,7 +755,7 @@ def should_continue(state: OrchestratorState) -> str:
         elif status == "error":
             return "error_handler"
         elif status == "done":
-            return "router"
+            return END
     
     # Citizen routing
     if active == "citizen":
@@ -773,12 +773,12 @@ def should_continue(state: OrchestratorState) -> str:
         elif status == "error":
             return "error_handler"
         elif status == "done":
-            return "router"
+            return END
     
     if state["storage_status"] == "error":
         return "error_handler"
     
-    return "router"
+    return END
 
 # =========================================================
 # GRAPH CONSTRUCTION
