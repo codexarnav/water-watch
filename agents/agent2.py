@@ -79,7 +79,7 @@ def load_from_kafka(state: Agent2State) -> Agent2State:
     Node 1: Load ONE message from sensor.cleaned
     """
     consumer = make_consumer()
-    msg = next(iter(consumer))         # ✅ consume one message
+    msg = next(iter(consumer))         
     consumer.close()
 
     clean_msg = msg.value
@@ -245,5 +245,5 @@ def run_agent2():
         time.sleep(0.05)
 
 
-if __name__ == "__main__":
-    run_agent2()
+# if __name__ == "__main__":
+#     run_agent2()

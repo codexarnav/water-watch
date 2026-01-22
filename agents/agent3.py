@@ -20,6 +20,7 @@ from transformers import CLIPProcessor, CLIPModel
 from transformers import AutoTokenizer, AutoModelForMaskedLM
 from transformers import ClapProcessor, ClapModel
 import librosa
+import whisper
 
 
 # =============================
@@ -43,10 +44,7 @@ clip_model = CLIPModel.from_pretrained(CLIP_REPO).to(device).eval()
 # CLAP (Audio)
 # =============================
 
-CLAP_REPO = "laion/clap-htsat-unfused"
-
-clap_processor = ClapProcessor.from_pretrained(CLAP_REPO)
-clap_model = ClapModel.from_pretrained(CLAP_REPO).to(device).eval()
+audio_model=whisper.load_model('base')
 
 
 # =============================
@@ -119,11 +117,9 @@ def embed_clip_image(image_uri: str):
 
 
 @torch.no_grad()
-def embed_clap_audio(audio_path: str):
-    audio, sr = librosa.load(audio_path, sr=48000)
-    inputs = clap_processor(audios=audio, sampling_rate=sr, return_tensors="pt").to(device)
-    return clap_model.get_audio_features(**inputs).squeeze().cpu().tolist()
-
+def transcribe_whisper(audio_path: str) -> str:
+    result = audio_model.transcribe(audio_path)
+    return result["text"].strip()
 
 @torch.no_grad()
 def embed_video_clip_frames(
@@ -211,10 +207,6 @@ def embed_lexical_sparse(text: str):
     return {"indices": indices, "values": values}
 
 
-# =============================
-# Agent B Core
-# =============================
-
 def agent_b_perceive(routed_signal: Dict) -> Optional[Dict]:
     modality = routed_signal.get("modality")
     payload = routed_signal.get("payload", {})
@@ -256,16 +248,16 @@ def agent_b_perceive(routed_signal: Dict) -> Optional[Dict]:
         uri = payload.get("audio_uri")
         if not uri:
             return None
-
+        transcript = transcribe_whisper(uri)
         return {
-            "percept_id": percept_id,
-            "modality": "audio",
-            "semantic_bind": embed_clap_audio(uri),
-            "context": context,
-            "raw_ref": {"audio_uri": uri}
+        "percept_id": percept_id,
+        "modality": "audio",
+        "semantic_bind": embed_clip_text(transcript),
+        "lexical_sparse": embed_lexical_sparse(transcript),
+        "context": context,
+        "raw_ref": {"audio_uri": uri, "transcript": transcript}
         }
 
-    # ---- VIDEO ----
     if modality == "video":
         uri = payload.get("video_uri")
         if not uri:
@@ -294,7 +286,7 @@ if __name__ == "__main__":
     demo_routed_signal = {
         "modality": "video",
         "payload": {
-            "video_uri": r"videos\9736660-hd_1920_1080_25fps.mp4"
+            "video_uri": "videos\9736660-hd_1920_1080_25fps.mp4"
         },
         "context": {
             "timestamp": "2026-01-21T10:12:00Z",

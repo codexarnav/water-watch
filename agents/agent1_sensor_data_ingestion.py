@@ -6,17 +6,12 @@ from typing import TypedDict, Dict, Any, Optional
 import pandas as pd
 from kafka import KafkaProducer, KafkaConsumer
 
-# LangGraph
 from langgraph.graph import StateGraph, END
 
 RAW_TOPIC = "sensor.raw"
 CLEAN_TOPIC = "sensor.cleaned"
 CSV_PATH = "water.csv"
 
-
-# =========================================================
-# PART 0: KAFKA PRODUCER (sensor simulator)
-# =========================================================
 def run_producer():
     data = pd.read_csv(CSV_PATH)
 
@@ -58,10 +53,6 @@ def run_producer():
     producer.close()
     print("[PRODUCER] finished ✅")
 
-
-# =========================================================
-# PART 1: LANGGRAPH STATE + AGENT 1 PIPELINE
-# =========================================================
 class Agent1State(TypedDict):
     raw: Optional[Dict[str, Any]]
     clean: Optional[Dict[str, Any]]
@@ -157,7 +148,6 @@ def publish_clean(state: Agent1State) -> Agent1State:
     return state
 
 
-# Build LangGraph for Agent1
 def build_agent1_graph():
     graph = StateGraph(Agent1State)
 
@@ -186,12 +176,9 @@ def run_agent1_loop():
         time.sleep(0.1)
 
 
-# =========================================================
-# MAIN
-# =========================================================
-if __name__ == "__main__":
-    # 1) Start the producer in one terminal first
-    # run_producer()
+# if __name__ == "__main__":
+   
+#     run_producer()
 
-    # 2) Start Agent1 in another terminal
-    run_agent1_loop()
+#     # 2) Start Agent1 in another terminal
+#     #run_agent1_loop()

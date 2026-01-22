@@ -1,15 +1,3 @@
-"""
-Hydro-Semantic RAG Agent (Multimodal-Aware)
--------------------------------------------
-• Gemini-powered reasoning
-• LangGraph-enforced JSON routing
-• Uses Agent 7 Retriever (unchanged)
-• Liquid vs Normal memory (explainable)
-• Citation-safe answers
-• **MULTIMODAL**: Preserves image/video/audio URIs
-• **GEOSPATIAL**: Converts geohash to coordinates
-• **MODALITY-AWARE**: Different handling for text vs media
-"""
 
 from typing import TypedDict, List, Dict, Any, Optional
 import numpy as np
@@ -17,11 +5,8 @@ import json
 
 from langgraph.graph import StateGraph, END
 
-from agent7_retriever import LiquidRetriever
+from agents.agent7_retriever import LiquidRetriever
 
-# =====================================================
-# Gemini Setup
-# =====================================================
 import google.generativeai as genai
 import os
 from dotenv import load_dotenv
