@@ -294,7 +294,7 @@ if __name__ == "__main__":
     demo_routed_signal = {
         "modality": "video",
         "payload": {
-            "video_uri": "videos\9736660-hd_1920_1080_25fps.mp4"
+            "video_uri": r"videos\9736660-hd_1920_1080_25fps.mp4"
         },
         "context": {
             "timestamp": "2026-01-21T10:12:00Z",

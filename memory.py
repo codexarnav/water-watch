@@ -7,7 +7,7 @@ from concurrent.futures import ThreadPoolExecutor
 from kafka import KafkaConsumer
 
 # ✅ use your existing embedder
-from embeddings import agent_b_perceive
+from citizen_embed import agent_b_perceive
 
 SENSOR_TOPIC = "events.queue"
 
@@ -54,11 +54,18 @@ def sensor_event_to_routed_signal(sensor_event: Dict[str, Any]) -> Dict[str, Any
     }
 
 
-def store_percept(percept: Dict[str, Any]) -> None:
+def create_voxel_from_percept(percept: Dict[str, Any]) -> Dict[str, Any]:
     """
-    Store percept in memory store (voxel-ready).
+    Create voxel structure from percept (without storing).
+    This is the canonical voxel format used across the system.
+    
+    Args:
+        percept: Percept dict from agent_b_perceive()
+        
+    Returns:
+        Voxel-ready record with vectors, context, and metadata
     """
-    record = {
+    return {
         "percept_id": percept["percept_id"],
         "modality": percept["modality"],
         "vectors": {
@@ -69,6 +76,14 @@ def store_percept(percept: Dict[str, Any]) -> None:
         "raw_ref": percept.get("raw_ref", {}),
         "ingested_at": time.time(),
     }
+
+
+def store_percept(percept: Dict[str, Any]) -> None:
+    """
+    Store percept in memory store (voxel-ready).
+    Uses create_voxel_from_percept() to create the voxel structure.
+    """
+    record = create_voxel_from_percept(percept)
 
     with MEM_LOCK:
         EMBEDDING_MEMORY[percept["percept_id"]] = record
