@@ -16,7 +16,7 @@ def run_producer():
     data = pd.read_csv(CSV_PATH)
 
     producer = KafkaProducer(
-        bootstrap_servers="localhost:9092",
+        bootstrap_servers="127.0.0.1:9092",
         value_serializer=lambda v: json.dumps(v).encode("utf-8"),
         key_serializer=lambda k: str(k).encode("utf-8"),
         retries=5
@@ -64,7 +64,7 @@ def consume_raw(state: Agent1State) -> Agent1State:
     """
     consumer = KafkaConsumer(
         RAW_TOPIC,
-        bootstrap_servers="localhost:9092",
+        bootstrap_servers="127.0.0.1:9092",
         auto_offset_reset="earliest",
         enable_auto_commit=True,
         group_id="agent1-preprocess",
@@ -133,7 +133,7 @@ def publish_clean(state: Agent1State) -> Agent1State:
         return state
 
     producer = KafkaProducer(
-        bootstrap_servers="localhost:9092",
+        bootstrap_servers="127.0.0.1:9092",
         value_serializer=lambda v: json.dumps(v).encode("utf-8"),
         key_serializer=lambda k: str(k).encode("utf-8"),
         retries=5

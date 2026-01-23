@@ -56,7 +56,7 @@ def build_semantic_text(well_id: str, metric: str, value: float, z: float) -> st
 def make_consumer():
     return KafkaConsumer(
         INPUT_TOPIC,
-        bootstrap_servers="localhost:9092",
+        bootstrap_servers="127.0.0.1:9092",
         auto_offset_reset="earliest",
         enable_auto_commit=True,
         group_id="agent2-stm-spike",
@@ -67,7 +67,7 @@ def make_consumer():
 
 def make_producer():
     return KafkaProducer(
-        bootstrap_servers="localhost:9092",
+        bootstrap_servers="127.0.0.1:9092",
         value_serializer=lambda v: json.dumps(v).encode("utf-8"),
         key_serializer=lambda k: str(k).encode("utf-8"),
         retries=5
