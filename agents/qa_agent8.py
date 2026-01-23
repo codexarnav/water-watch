@@ -26,7 +26,7 @@ def decode_geohash(gh: Optional[str]) -> Optional[Dict[str, float]]:
         return None
     try:
         lat, lon = geohash2.decode(gh)
-        return {"lat": round(lat, 6), "lon": round(lon, 6)}
+        return {"lat": round(float(lat), 6), "lon": round(float(lon), 6)}
     except Exception:
         return None
 
