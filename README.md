@@ -20,105 +20,111 @@ This project uses a mesh of intelligent agents to continually monitor data, dete
 
 ---
 
-## 🚀 2. Setup & Running Guide (`main_script.py`)
+## 🧠 2. AI Engine & Models
 
-The `main_script.py` is the central entry point. It handles environment validation, infrastructure checks, and pipeline execution.
+Water Watch doesn't just "call an API"—it runs a sophisticated local + cloud hybrid AI mesh. When you run the system, the following models are verified and loaded:
 
-### ✅ Prerequisites
-*   **Docker Desktop** (must be running)
-*   **Python 3.8+**
+| Role | Model / Transformer | Purpose |
+| :--- | :--- | :--- |
+| **Reasoning & Chat** | **`gemini-2.0-flash`** | The "Cortex" of the system. Used for complex risk forecasting, "Why" analysis, and RAG chatbot answers. |
+| **Vision & Text** | **`openai/clip-vit-base-patch32`** | **Multimodal Embeddings.** Converts sensor logs, images, and text descriptions into shared 512-dim vector space for Qdrant. |
+| **Audio Analysis** | **`whisper-base`** | **Transcription.** Converts audio reports (e.g., "water rushing noise") into text for processing. |
+| **Keyword Search** | **`naver/splade-cocondenser...`** | **Sparse Retrieval.** Generates lexical weights to ensure specific keywords (chemicals, locations) aren't lost in vector search. |
+
+> **Note:** The local models (CLIP, Whisper, SPLADE) will be downloaded automatically by HuggingFace `transformers` on the first run.
 
 ---
 
+## 🚀 3. Setup & Running Guide
+
+### 🧠 The Orchestrator: `main_script.py`
+The entire system is managed by `main_script.py`. Instead of manually running 11 separate agent files, this script acts as a unified commander that:
+
+1.  **Validates Infrastructure**: Automatically checks if Docker, Kafka, and Qdrant are active before starting.
+2.  **Initializes Resources**: Creates required Kafka topics (`sensor.raw`, `sensor.cleaned`) and Qdrant collections (`water_memory` with 3 vector spaces) if they don't exist.
+3.  **Manages Threading**: Launches the ingestion, preprocessing, spike detection, and forecasting agents in parallel background threads.
+4.  **Provides a UI**: Offers a clean interactive CLI for users to control the system.
+
+---
+
+### ✅ Prerequisites
+*   **Docker Desktop** (Must be running for Kafka/Qdrant)
+*   **Python 3.8+**
+
 ### Step A: Configure Environment
-Create a `.env` file in the root directory. Copy the following template and fill in your details:
+Create a `.env` file in the root directory.
 
 ```ini
 # --- AI & LLM Configuration ---
 GEMINI_API_KEY=your_google_gemini_api_key
 
-# --- Infrastructure (Docker Default) ---
+# --- Infrastructure ---
 KAFKA_BOOTSTRAP_SERVERS=127.0.0.1:9092
-KAFKA_RAW_TOPIC=sensor.raw
-KAFKA_CLEAN_TOPIC=sensor.cleaned
 QDRANT_HOST=127.0.0.1
 QDRANT_PORT=6333
-QDRANT_COLLECTION=water_watch_vectors
 
-# --- Alerting (SMTP) ---
-# Enable/Disable email alerts (true/false)
+# --- Email Alerts ---
 ENABLE_SMTP_ALERTS=true
-SMTP_HOST=smtp.gmail.com
-SMTP_PORT=587
 SMTP_USER=your_email@gmail.com
 SMTP_PASSWORD=your_app_password
-SMTP_FROM=waterwatch@system.com
 SMTP_TO=admin@waterwatch.com
 
-# --- System Tuning ---
+# --- Tuning ---
 RISK_HIGH_THRESHOLD=0.7
-LOG_LEVEL=INFO
 ```
 
 ### Step B: Start Infrastructure
-The system requires Kafka and Qdrant to be running.
 ```bash
 docker-compose up -d
 ```
-> **Note:** Wait about 30 seconds for Kafka to fully initialize before starting the script.
+> **⏳ Important:** Wait 30-60 seconds after this command for Kafka to fully initialize.
 
 ### Step C: Install Dependencies
-Install the required Python packages:
 ```bash
 pip install -r requirements.txt
 ```
 
-### Step D: Run the System
-Execute the main orchestrator script:
+---
+
+### Step D: Execution Modes
+
+You can run the system in **Interactive Mode** (recommended) or **Headless Mode** (for automation).
+
+#### 1. 🎮 Interactive Mode
+The easiest way to use Water Watch.
 ```bash
 python main_script.py
 ```
+**What happens next?**
+The script performs a self-check and presents a menu:
+*   **Option 1: End-to-End Pipeline**
+    *   Starts streaming `water.csv` simulated data.
+    *   Agents clean data -> Detect Spikes -> Generate Embeddings -> Store in Qdrant.
+    *   Every 30s, the Forecaster predicts risk and sends an email if it exceeds `0.7`.
+*   **Option 2: Chatbot**
+    *   Enters a loop where you can ask questions like *"How many high-risk events happened today?"*.
+    *   The system uses specific vector retrieval to answer based on the sensor history.
 
----
+#### 2. 🤖 Headless / CLI Mode
+Use these flags to run specific components directly without user input:
 
-## 🎮 Interactive Menu
-
-When you run `python main_script.py`, you will see the following menu:
-
-### 1. 📈 Run Forecasting Pipeline (End-to-End)
-*   **What it does:**
-    1.  **Ingests** data from `water.csv`.
-    2.  **Streams** it through Kafka.
-    3.  **Detects** spikes and anomalies.
-    4.  **Vectorizes** data into Qdrant memory.
-    5.  **Forecasts** future risks based on history.
-    6.  **Alerts** via Email if risk > 0.7.
-*   **Options:** You can limit the number of rows processed (e.g., test with just 50 rows).
-
-### 2. 💬 Start Chatbot Interface
-*   **What it does:** Opens a terminal-based chat interface.
-*   **Features:**
-    *   Ask questions about water quality (e.g., *"What is the risk level at the Bay?"*).
-    *   Uses RAG (Retrieval Augmented Generation) to fetch real data from Qdrant.
-
-### 3. Closes the application.
-
----
-
-## 🔧 Advanced Usage (CLI Flags)
-
-You can also run the script with arguments to bypass the menu:
-
+**Run the Forecasting Pipeline:**
 ```bash
-# Run the forecasting pipeline directly
+# Run the full pipeline (Ingestion -> AI -> Alerts)
 python main_script.py --mode forecasting
 
-# Run the chatbot directly
+# Run with a limit (e.g., process only the first 50 rows of data)
+python main_script.py --mode forecasting --data-limit 50
+```
+
+**Run the Chatbot Only:**
+```bash
+# Skip the menu and go straight to chat
 python main_script.py --mode chatbot
+```
 
-# Run with a data limit (e.g., only process 100 rows)
-python main_script.py --mode forecasting --data-limit 100
-
-# Dry Run (Check connections without processing data)
+**Verify System Status:**
+```bash
+# Check if Kafka/Qdrant are reachable without running agents
 python main_script.py --dry-run
 ```

@@ -5,12 +5,12 @@ from concurrent.futures import ThreadPoolExecutor
 
 from kafka import KafkaConsumer
 
-# ✅ your embedder
+
 from agents.agent3 import agent_b_perceive
 
 SENSOR_TOPIC = "events.queue"
 
-# Parallel execution config
+
 MAX_WORKERS = 6
 MAX_INFLIGHT = 200
 
@@ -31,7 +31,7 @@ def run_agent4_parallel(embedding_memory: Dict[str, Dict[str, Any]], mem_lock):
     def make_consumer():
         return KafkaConsumer(
             SENSOR_TOPIC,
-            bootstrap_servers="127.0.0.1:9092",
+            bootstrap_servers="localhost:9092",
             auto_offset_reset="earliest",
             enable_auto_commit=True,
             group_id="agent5-memory-parallel",

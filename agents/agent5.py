@@ -1,18 +1,7 @@
-"""
-Agent 5: Hydro-Kernel Memory Orchestrator
-----------------------------------------
-- Starts Agent4 (Kafka consumer + parallel embedding)
-- Maintains EMBEDDING_MEMORY (shared staging buffer)
-- Flushes hydro-voxels into Qdrant in batches
-- Video vectors get split + Binary Quantization (collection schema)
-- Safe snapshot+clear to prevent RAM overflow
-"""
-
 import time
 import uuid
 import threading
 from typing import Dict, Any, List
-
 from qdrant_client import QdrantClient
 from qdrant_client.models import (
     VectorParams,
@@ -23,36 +12,22 @@ from qdrant_client.models import (
     PayloadSchemaType,
 )
 
-# ✅ IMPORT AGENT4 DIRECTLY
-# Agent4 must expose:
-# - run_agent4_parallel(embedding_memory, mem_lock)
-# so Agent5 can call it
 from agents.agent4 import run_agent4_parallel
 
-# =================================================
-# Shared In-Memory Store (Staging Buffer)
-# =================================================
+
 EMBEDDING_MEMORY: Dict[str, Dict[str, Any]] = {}
 MEM_LOCK = threading.Lock()
 
-# =================================================
-# Qdrant Configuration
-# =================================================
 QDRANT_URL = "http://localhost:6333"
 COLLECTION = "water_memory"
 client = QdrantClient(url=QDRANT_URL)
 
-# =================================================
-# Flush Config
-# =================================================
 BATCH_SIZE = 100
 FLUSH_INTERVAL_SEC = 2
 MAX_RETRY = 3
 
 
-# -------------------------------------------------
-# 1) Ensure Qdrant collection exists (K-map schema)
-# -------------------------------------------------
+
 def ensure_collection():
     if client.collection_exists(COLLECTION):
         return
@@ -176,7 +151,7 @@ def snapshot_and_clear_memory() -> List[Dict[str, Any]]:
     return voxels
 
 
-# -------------------------------------------------
+# -------------------------------------------------ī
 # 5) Batch upsert into Qdrant
 # -------------------------------------------------
 def upsert_points(points: List[PointStruct]):

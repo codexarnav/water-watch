@@ -1,16 +1,3 @@
-"""
-Water-Watch Master Orchestration Agent (Refactored)
-===================================================
-
-LangGraph orchestrator that imports and uses functions from existing files:
-- kafka_stream.py: preprocess()
-- agent2.py: STM, parse_iso(), compute_z(), build_semantic_text(), spike_detection(), update_stm()
-- memory.py: sensor_event_to_routed_signal(), store_percept()
-- citizen_input.py: agent_a_route()
-- citizen_embed.py: agent_b_perceive()
-- kernel.py: ensure_collection(), store_hydro_voxel()
-"""
-
 import json
 import time
 import logging
@@ -24,11 +11,11 @@ from kafka import KafkaConsumer, KafkaProducer
 
 # ===== Import from existing files =====
 # From kafka_stream.py
-from kafka_stream import preprocess as kafka_preprocess_state
+from agents.agent1_sensor_data_ingestion import preprocess as kafka_preprocess_state
 
 # From agent2.py
-import agent2
-from agent2 import (
+import agents.agent2 as agent2
+from agents.agent2 import (
     STM,  # Short-term memory dict
     parse_iso,
     compute_z,
@@ -40,14 +27,14 @@ from agent2 import (
 )
 
 # From memory.py
-from memory import sensor_event_to_routed_signal, store_percept, create_voxel_from_percept
+from agents.agent4 import sensor_event_to_routed_signal, store_percept, create_voxel_from_percept
 
 # From citizen files
 from citizen_input import agent_a_route
-from citizen_embed import agent_b_perceive
+from agents.agent3 import agent_b_perceive
 
 # From kernel
-from kernel import ensure_collection, store_hydro_voxel
+from agents.agent5 import ensure_collection, store_hydro_voxel
 
 # =========================================================
 # LOGGING CONFIGURATION
