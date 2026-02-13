@@ -28,6 +28,12 @@ class Settings(BaseSettings):
 
     FASTAPI_HOST: str = "0.0.0.0"
     FASTAPI_PORT: int = 8000
+    
+    REDIS_HOST: str = "localhost"
+    REDIS_PORT: int = 6379
+    REDIS_DB: int = 0
+
+    ALERT_DEDUP_TTL_SECONDS: int = 900  # 15 min
 
     @model_validator(mode="after")
     def validate_smtp(self):
