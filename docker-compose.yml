@@ -62,42 +62,42 @@ services:
       timeout: 5s
       retries: 5
 
-  # FastAPI Backend
-  fastapi:
-    build:
-      context: ./backend
-      dockerfile: Dockerfile
-    container_name: water_watch_backend
-    networks:
-      - water_watch_network
-    depends_on:
-      kafka:
-        condition: service_healthy
-      qdrant:
-        condition: service_healthy
-    ports:
-      - "8000:8000"
-    volumes:
-      - ./backend:/app
-      - ./water.csv:/app/water.csv
-    env_file:
-      - .env
-    restart: unless-stopped
+  # # FastAPI Backend
+  # fastapi:
+  #   build:
+  #     context: ./backend
+  #     dockerfile: Dockerfile
+  #   container_name: water_watch_backend
+  #   networks:
+  #     - water_watch_network
+  #   depends_on:
+  #     kafka:
+  #       condition: service_healthy
+  #     qdrant:
+  #       condition: service_healthy
+  #   ports:
+  #     - "8000:8000"
+  #   volumes:
+  #     - ./backend:/app
+  #     - ./water.csv:/app/water.csv
+  #   env_file:
+  #     - .env
+  #   restart: unless-stopped
 
-  # Streamlit Dashboard
-  streamlit:
-    build:
-      context: ./dashboard
-      dockerfile: Dockerfile
-    container_name: water_watch_dashboard
-    networks:
-      - water_watch_network
-    depends_on:
-      - fastapi
-    ports:
-      - "8501:8501"
-    volumes:
-      - ./dashboard:/app
-    environment:
-      - FASTAPI_URL=http://fastapi:8000
-    restart: unless-stopped
+  # # Streamlit Dashboard
+  # streamlit:
+  #   build:
+  #     context: ./dashboard
+  #     dockerfile: Dockerfile
+  #   container_name: water_watch_dashboard
+  #   networks:
+  #     - water_watch_network
+  #   depends_on:
+  #     - fastapi
+  #   ports:
+  #     - "8501:8501"
+  #   volumes:
+  #     - ./dashboard:/app
+  #   environment:
+  #     - FASTAPI_URL=http://fastapi:8000
+  #   restart: unless-stopped

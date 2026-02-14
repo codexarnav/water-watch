@@ -18,16 +18,10 @@ from qdrant_client.http.models import (
 import google.generativeai as genai
 from dotenv import load_dotenv
 
-# ============================
-# ENV + LLM
-# ============================
 load_dotenv()
 genai.configure(api_key=os.getenv("GEMINI_API_KEY"))
 llm = genai.GenerativeModel("gemini-2.0-flash")
 
-# ============================
-# QDRANT CONFIG
-# ============================
 QDRANT_URL = "http://localhost:6333"
 COLLECTION = "water_memory"
 
@@ -37,9 +31,6 @@ VECTOR_FALLBACK = "semantic_bind"
 
 client = QdrantClient(url=QDRANT_URL)
 
-# ============================
-# DEFAULTS
-# ============================
 DEFAULT_WINDOW = "24h"
 DEFAULT_HORIZON = "6h"
 DEFAULT_MODE = "risk+evidence+why"

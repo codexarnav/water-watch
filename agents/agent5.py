@@ -229,5 +229,5 @@ def run_system():
     qdrant_flush_loop()
 
 
-if __name__ == "__main__":
-    run_system()
+# if __name__ == "__main__":
+#     run_system()

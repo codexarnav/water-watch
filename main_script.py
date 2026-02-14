@@ -1,662 +1,957 @@
-#!/usr/bin/env python3
-"""
-Water Watch - End-to-End Integration Script
-============================================
-
-Orchestrates the complete Water Watch system with real integrations:
-- Forecasting Flow: CSV → Kafka → Preprocessing → Spike Detection → Embeddings → Qdrant → Risk Forecasting → SMTP
-- Chatbot Flow: Multimodal Inputs → Embeddings → Memory → Qdrant → RAG → Responses
-
-Author: Water Watch Team
-"""
-
-import os
-import sys
-import time
-import json
-import signal
-import argparse
+import asyncio
 import threading
-from datetime import datetime
-from typing import Dict, Any, Optional, List
+import time
+import logging
+import json
+import subprocess
+from typing import Dict, Any, Optional, List, TypedDict, Literal, Union
+from datetime import datetime, timezone
+from enum import Enum
+import uuid
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
-# Environment setup
+# ML/Torch
+import torch
+import numpy as np
+import pandas as pd
+
+# API & LLM
+import google.generativeai as genai
 from dotenv import load_dotenv
-load_dotenv()
+import os
 
-# Kafka
-from kafka import KafkaProducer, KafkaConsumer, KafkaAdminClient
-from kafka.admin import NewTopic
-from kafka.errors import TopicAlreadyExistsError, NoBrokersAvailable
-
-# Qdrant
+# Vector DB
 from qdrant_client import QdrantClient
-from qdrant_client.models import Distance, VectorParams, PointStruct
 
-# SMTP
-import smtplib
-from email.mime.text import MIMEText
-from email.mime.multipart import MIMEMultipart
+# LangGraph
+from langgraph.graph import StateGraph, END
 
-# Logging
-import logging
+# ==================== CONFIG ====================
+load_dotenv()
+genai.configure(api_key=os.getenv("GEMINI_API_KEY"))
+llm = genai.GenerativeModel("gemini-2.0-flash")
+
+logger = logging.getLogger(__name__)
 logging.basicConfig(
     level=logging.INFO,
-    format='%(asctime)s [%(levelname)s] %(name)s: %(message)s',
-    datefmt='%Y-%m-%d %H:%M:%S'
+    format='%(asctime)s - [%(name)s] - %(levelname)s - %(message)s'
 )
-logger = logging.getLogger("WaterWatch")
 
-# =============================================================================
-# CONFIGURATION
-# =============================================================================
+# ==================== CONSTANTS ====================
+QDRANT_URL = "http://localhost:6333"
+COLLECTION = "water_memory"
+KAFKA_BROKERS = "localhost:9092"
 
-class Config:
-    """Centralized configuration from environment variables"""
-    
-    # Gemini API
-    GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
-    
-    # Kafka
-    KAFKA_BOOTSTRAP_SERVERS = os.getenv("KAFKA_BOOTSTRAP_SERVERS", "127.0.0.1:9092")
-    KAFKA_RAW_TOPIC = os.getenv("KAFKA_RAW_TOPIC", "sensor.raw")
-    KAFKA_CLEAN_TOPIC = os.getenv("KAFKA_CLEAN_TOPIC", "sensor.cleaned")
-    KAFKA_EVENT_TOPIC = os.getenv("KAFKA_EVENT_TOPIC", "events.queue")
-    
-    # Qdrant
-    QDRANT_HOST = os.getenv("QDRANT_HOST", "127.0.0.1")
-    QDRANT_PORT = int(os.getenv("QDRANT_PORT", "6333"))
-    QDRANT_COLLECTION = os.getenv("QDRANT_COLLECTION", "water_watch_vectors")
-    QDRANT_VECTOR_SIZE = int(os.getenv("QDRANT_VECTOR_SIZE", "384"))
-    
-    # SMTP
-    SMTP_HOST = os.getenv("SMTP_HOST", "smtp.gmail.com")
-    SMTP_PORT = int(os.getenv("SMTP_PORT", "587"))
-    SMTP_USER = os.getenv("SMTP_USER")
-    SMTP_PASSWORD = os.getenv("SMTP_PASSWORD")
-    SMTP_FROM = os.getenv("SMTP_FROM", "waterwatch@gmail.com")
-    SMTP_TO = os.getenv("SMTP_TO", "admin@waterwatch.com")
-    
-    # Risk Thresholds
-    RISK_HIGH_THRESHOLD = float(os.getenv("RISK_HIGH_THRESHOLD", "0.7"))
-    RISK_MEDIUM_THRESHOLD = float(os.getenv("RISK_MEDIUM_THRESHOLD", "0.4"))
-    
-    # Data
-    CSV_PATH = "water.csv"
-    
-    # Script Config
-    LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO")
-    DATA_BATCH_SIZE = int(os.getenv("DATA_BATCH_SIZE", "10"))
-    ENABLE_SMTP_ALERTS = os.getenv("ENABLE_SMTP_ALERTS", "true").lower() == "true"
-    CHATBOT_ENABLED = os.getenv("CHATBOT_ENABLED", "true").lower() == "true"
+VECTOR_SENSOR = "sensor_dense"
+VECTOR_FALLBACK = "semantic_bind"
 
-config = Config()
+DEFAULT_WINDOW = "24h"
+DEFAULT_HORIZON = "6h"
+DEFAULT_MODE = "risk+evidence+why"
 
-# =============================================================================
-# GLOBAL STATE
-# =============================================================================
+SIM_SEARCH_GATE = 0.55
+SIM_TOPK = 30
+SIM_SEVERITY_MIN = 0.4
 
-class SystemState:
-    """Global system state for orchestration"""
-    def __init__(self):
-        self.running = True
-        self.threads: List[threading.Thread] = []
-        self.kafka_producer: Optional[KafkaProducer] = None
-        self.qdrant_client: Optional[QdrantClient] = None
-        self.stats = {
-            "rows_produced": 0,
-            "rows_preprocessed": 0,
-            "spikes_detected": 0,
-            "embeddings_created": 0,
-            "qdrant_stored": 0,
-            "forecasts_made": 0,
-            "emails_sent": 0,
-            "chatbot_queries": 0,
-            "errors": 0
+BASE_DIR = Path(__file__).resolve().parent
+WHATSAPP_DIR = BASE_DIR / "whatsapp"
+
+device = "cuda" if torch.cuda.is_available() else "cpu"
+
+# ==================== IMPORTS ====================
+from agents.agent1_sensor_data_ingestion import (
+    consume_raw, preprocess, publish_clean, Agent1State
+)
+
+from agents.agent2 import (
+    make_consumer, parse_iso, compute_z, 
+    build_semantic_text, STM_SECONDS, MIN_POINTS, Z_THRESH, STM
+)
+
+from agents.agent3 import agent_b_perceive
+
+from agents.agent5 import (
+    ensure_collection, voxel_to_point, upsert_points, EMBEDDING_MEMORY, MEM_LOCK
+)
+
+from agents.agent6_forecasting import forecast
+
+from agents.agent7_retriever import LiquidRetriever
+
+# ==================== ENUMS ====================
+class InputModality(str, Enum):
+    TEXT = "text"
+    IMAGE = "image"
+    AUDIO = "audio"
+    VIDEO = "video"
+
+class InputChannel(str, Enum):
+    DIRECT = "direct"          # Direct user upload
+    WHATSAPP = "whatsapp"      # WhatsApp Web message
+
+# ==================== STATE SCHEMA ====================
+class UserInputPacket(TypedDict):
+    """User-provided content (from direct input or WhatsApp)"""
+    input_id: str
+    channel: InputChannel      # NEW: Track source (direct or whatsapp)
+    modality: InputModality
+    content: str
+    source_id: str
+    metadata: Dict[str, Any]
+
+class SensorDataPacket(TypedDict):
+    """Sensor stream data"""
+    raw_data: Optional[Dict[str, Any]]
+    cleaned_data: Optional[Dict[str, Any]]
+    spike_event: Optional[Dict[str, Any]]
+    semantic_event: Optional[Dict[str, Any]]
+
+class EmbeddingPacket(TypedDict):
+    """User content embeddings"""
+    percept: Optional[Dict[str, Any]]
+    percept_id: Optional[str]
+    embeddings: Dict[str, Any]
+    vector_stored: bool
+
+class LiquidMemoryPacket(TypedDict):
+    """Retrieval results from Agent 7 (liquid memory)"""
+    query_vector: Optional[List[float]]
+    retrieved_items: List[Dict[str, Any]]
+    num_items: int
+    avg_score: float
+
+class AnalysisPacket(TypedDict):
+    """Downstream analysis outputs"""
+    forecast_result: Optional[Dict[str, Any]]
+    qa_result: Optional[Dict[str, Any]]
+    recommendations: Optional[List[Dict[str, Any]]]
+    priority_actions: Optional[List[str]]
+
+class PipelineState(TypedDict):
+    """Complete pipeline state"""
+    # Metadata
+    pipeline_id: str
+    created_at: float
+    
+    # Input
+    user_input: Optional[UserInputPacket]
+    
+    # Parallel Path A: User Content
+    embedding_packet: Optional[EmbeddingPacket]
+    
+    # Parallel Path B: Sensor Stream
+    sensor_packet: Optional[SensorDataPacket]
+    
+    # CENTRAL HUB: Liquid Memory Retrieval (Agent 7)
+    liquid_memory: Optional[LiquidMemoryPacket]
+    
+    # Downstream Analysis
+    analysis: Optional[AnalysisPacket]
+    
+    # Tracking
+    completed_agents: List[str]
+    errors: List[str]
+
+# ==================== WHATSAPP INTEGRATION ====================
+
+def parse_whatsapp_message(message_data: Dict[str, Any]) -> UserInputPacket:
+    """
+    Convert WhatsApp message data to UserInputPacket
+    
+    Message format from scraper.py:
+    {
+        "modality": "text|image|audio|video",
+        "payload": {...},
+        "context": {
+            "timestamp": ISO timestamp,
+            "source": "whatsapp",
+            "geohash": "unknown"
         }
-        self.lock = threading.Lock()
-
-state = SystemState()
-
-# =============================================================================
-# SIGNAL HANDLERS
-# =============================================================================
-
-def signal_handler(signum, frame):
-    """Graceful shutdown on SIGINT/SIGTERM"""
-    logger.info("🛑 Shutdown signal received. Cleaning up...")
-    state.running = False
-    
-    # Wait for threads to finish
-    for thread in state.threads:
-        if thread.is_alive():
-            thread.join(timeout=5)
-    
-    # Close connections
-    if state.kafka_producer:
-        state.kafka_producer.close()
-    
-    logger.info("✅ Shutdown complete")
-    sys.exit(0)
-
-signal.signal(signal.SIGINT, signal_handler)
-signal.signal(signal.SIGTERM, signal_handler)
-
-# =============================================================================
-# INFRASTRUCTURE VERIFICATION
-# =============================================================================
-
-def verify_docker_services() -> bool:
-    """Verify Docker services (Kafka, Qdrant) are running"""
-    logger.info("🔍 Verifying Docker services...")
-    
-    # Check Kafka
-    try:
-        admin_client = KafkaAdminClient(
-            bootstrap_servers=config.KAFKA_BOOTSTRAP_SERVERS,
-            request_timeout_ms=5000
-        )
-        admin_client.close()
-        logger.info("✅ Kafka is running on %s", config.KAFKA_BOOTSTRAP_SERVERS)
-    except Exception as e:
-        logger.error("❌ Kafka not available: %s", e)
-        logger.error("   Please run: docker-compose up -d")
-        return False
-    
-    # Check Qdrant
-    try:
-        client = QdrantClient(host=config.QDRANT_HOST, port=config.QDRANT_PORT)
-        client.get_collections()
-        logger.info("✅ Qdrant is running on %s:%s", config.QDRANT_HOST, config.QDRANT_PORT)
-    except Exception as e:
-        logger.error("❌ Qdrant not available: %s", e)
-        logger.error("   Please run: docker-compose up -d")
-        return False
-    
-    return True
-
-def verify_environment() -> bool:
-    """Verify environment variables are set"""
-    logger.info("🔍 Verifying environment configuration...")
-    
-    required = {
-        "GEMINI_API_KEY": config.GEMINI_API_KEY,
-        "SMTP_USER": config.SMTP_USER,
-        "SMTP_PASSWORD": config.SMTP_PASSWORD,
     }
-    
-    missing = [k for k, v in required.items() if not v]
-    
-    if missing:
-        logger.error("❌ Missing required environment variables: %s", ", ".join(missing))
-        logger.error("   Please check your .env file")
-        return False
-    
-    logger.info("✅ Environment configuration valid")
-    return True
-
-def verify_data_file() -> bool:
-    """Verify water.csv exists"""
-    logger.info("🔍 Verifying data file...")
-    
-    if not os.path.exists(config.CSV_PATH):
-        logger.error("❌ Data file not found: %s", config.CSV_PATH)
-        return False
-    
-    logger.info("✅ Data file found: %s", config.CSV_PATH)
-    return True
-
-# =============================================================================
-# KAFKA SETUP
-# =============================================================================
-
-def create_kafka_topics():
-    """Create Kafka topics if they don't exist"""
-    logger.info("📋 Creating Kafka topics...")
-    
+    """
+    modality_str = message_data.get("modality", "text").lower()
     try:
-        admin_client = KafkaAdminClient(
-            bootstrap_servers=config.KAFKA_BOOTSTRAP_SERVERS,
-            request_timeout_ms=10000
-        )
+        modality = InputModality[modality_str.upper()]
+    except KeyError:
+        modality = InputModality.TEXT
+    
+    payload = message_data.get("payload", {})
+    context = message_data.get("context", {})
+    
+    # Extract content based on modality
+    content = ""
+    if modality == InputModality.TEXT:
+        content = payload.get("text", "")
+    elif modality == InputModality.IMAGE:
+        content = payload.get("image_uri", "")
+    elif modality == InputModality.AUDIO:
+        content = payload.get("audio_uri", "")
+    elif modality == InputModality.VIDEO:
+        content = payload.get("video_uri", "")
+    
+    return UserInputPacket(
+        input_id=str(uuid.uuid4()),
+        channel=InputChannel.WHATSAPP,
+        modality=modality,
+        content=content,
+        source_id=context.get("geohash", "whatsapp_user"),
+        metadata={
+            "source_channel": "whatsapp",
+            "timestamp": context.get("timestamp"),
+            "geohash": context.get("geohash"),
+            "whatsapp_original": message_data
+        }
+    )
+
+def start_whatsapp_listener() -> threading.Thread:
+    """
+    Start WhatsApp scraper in background thread
+    Monitors messages.jsonl file for new messages
+    """
+    def listen_whatsapp():
+        """Listen to WhatsApp scraper output"""
+        try:
+            processor_script = WHATSAPP_DIR / "processor.py"
+            logger.info(f"🔌 Starting WhatsApp listener: {processor_script}")
+            
+            # Run processor.py which handles scraper communication
+            process = subprocess.Popen(
+                ["python", "-u", str(processor_script)],
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                cwd=str(WHATSAPP_DIR)
+            )
+            
+            logger.info("⏳ WhatsApp listener running (Awaiting messages...)")
+            
+            # Keep process alive
+            while True:
+                stdout_line = process.stdout.readline()
+                if stdout_line:
+                    logger.info(f"[WhatsApp] {stdout_line.strip()}")
+                
+                if process.poll() is not None:
+                    break
+            
+            logger.warning("⚠️ WhatsApp listener stopped")
+            
+        except Exception as e:
+            logger.error(f"❌ WhatsApp listener error: {e}")
+    
+    # Start in daemon thread
+    thread = threading.Thread(target=listen_whatsapp, daemon=True)
+    thread.start()
+    return thread
+
+def poll_whatsapp_messages() -> Optional[UserInputPacket]:
+    """
+    Poll messages.jsonl for new WhatsApp messages
+    Returns None if no new messages
+    """
+    try:
+        messages_file = WHATSAPP_DIR / "messages.jsonl"
         
-        topics = [
-            NewTopic(name=config.KAFKA_RAW_TOPIC, num_partitions=3, replication_factor=1),
-            NewTopic(name=config.KAFKA_CLEAN_TOPIC, num_partitions=3, replication_factor=1),
-            NewTopic(name=config.KAFKA_EVENT_TOPIC, num_partitions=3, replication_factor=1),
-        ]
+        if not messages_file.exists():
+            return None
+        
+        # Read last line (most recent message)
+        with open(messages_file, "r", encoding="utf-8") as f:
+            lines = f.readlines()
+        
+        if not lines:
+            return None
+        
+        # Parse last message
+        try:
+            last_message_data = json.loads(lines[-1].strip())
+            user_packet = parse_whatsapp_message(last_message_data)
+            logger.info(f"📱 WhatsApp message received: {user_packet['modality'].value}")
+            return user_packet
+        except json.JSONDecodeError:
+            return None
+            
+    except Exception as e:
+        logger.warning(f"⚠️ Error polling WhatsApp messages: {e}")
+        return None
+
+# ==================== PIPELINE NODES ====================
+
+def node_user_input(state: PipelineState) -> PipelineState:
+    """
+    Entry point: Validate and log user input (from direct or WhatsApp)
+    """
+    try:
+        user_input = state["user_input"]
+        if not user_input:
+            state["errors"].append("No user input provided")
+            return state
+        
+        channel_emoji = "📱" if user_input["channel"] == InputChannel.WHATSAPP else "📥"
+        
+        logger.info(
+            f"[USER_INPUT] {channel_emoji} [{user_input['channel'].value}] "
+            f"Received {user_input['modality'].value} | source_id={user_input['source_id']}"
+        )
+        return state
+        
+    except Exception as e:
+        state["errors"].append(f"USER_INPUT: {str(e)}")
+        logger.error(f"[USER_INPUT] ❌ Error: {e}")
+        return state
+
+def node_perception_embedding(state: PipelineState) -> PipelineState:
+    """
+    Agent 3: Multimodal Perception & Embedding
+    Works for both direct input and WhatsApp messages
+    """
+    try:
+        user_input = state["user_input"]
+        if not user_input:
+            return state
+        
+        modality = user_input["modality"]
+        content = user_input["content"]
+        
+        # Build routed signal for Agent 3
+        routed_signal = {
+            "modality": modality.value,
+            "payload": {
+                "text": content if modality == InputModality.TEXT else None,
+                "image_uri": content if modality == InputModality.IMAGE else None,
+                "audio_uri": content if modality == InputModality.AUDIO else None,
+                "video_uri": content if modality == InputModality.VIDEO else None,
+            },
+            "context": {
+                "timestamp": datetime.now(tz=timezone.utc).isoformat(),
+                "source_id": user_input.get("source_id", "user"),
+                "channel": user_input["channel"].value,
+                "metadata": user_input.get("metadata", {})
+            }
+        }
+        
+        # Call Agent 3: Unified perception
+        percept = agent_b_perceive(routed_signal)
+        
+        if percept is None:
+            state["errors"].append("Perception failed")
+            logger.warning("[AGENT3] ⚠️ Perception returned None")
+            return state
+        
+        # Extract embeddings
+        embeddings = {
+            "semantic_bind": percept.get("semantic_bind"),
+            "lexical_sparse": percept.get("lexical_sparse"),
+        }
+        
+        state["embedding_packet"] = {
+            "percept": percept,
+            "percept_id": percept.get("percept_id"),
+            "embeddings": embeddings,
+            "vector_stored": False
+        }
+        
+        logger.info(
+            f"[AGENT3] ✅ Embeddings generated | modality={modality.value} | "
+            f"channel={user_input['channel'].value}"
+        )
+        state["completed_agents"].append("AGENT3")
+        return state
+        
+    except Exception as e:
+        state["errors"].append(f"AGENT3: {str(e)}")
+        logger.error(f"[AGENT3] ❌ Error: {e}")
+        return state
+
+def node_embedding_memory_store(state: PipelineState) -> PipelineState:
+    """
+    Agent 4: Store embeddings in thread-safe shared memory
+    """
+    try:
+        embedding_packet = state["embedding_packet"]
+        if not embedding_packet or not embedding_packet.get("percept"):
+            return state
+        
+        percept = embedding_packet["percept"]
+        vectors = {}
+        
+        for key in ["semantic_bind", "semantic_image", "semantic_audio", 
+                    "sensor_dense", "semantic_video", "lexical_sparse"]:
+            if key in percept and percept[key] is not None:
+                vectors[key] = percept[key]
+        
+        hydro_voxel = {
+            "percept_id": percept["percept_id"],
+            "modality": percept.get("modality", "unknown"),
+            "vectors": vectors,
+            "context": percept.get("context", {}),
+            "raw_ref": percept.get("raw_ref", {}),
+            "ingested_at": time.time(),
+        }
+        
+        with MEM_LOCK:
+            EMBEDDING_MEMORY[percept["percept_id"]] = hydro_voxel
+        
+        logger.info(f"[AGENT4] ✅ Stored in memory | percept_id={percept['percept_id']}")
+        state["completed_agents"].append("AGENT4")
+        return state
+        
+    except Exception as e:
+        state["errors"].append(f"AGENT4: {str(e)}")
+        logger.error(f"[AGENT4] ❌ Error: {e}")
+        return state
+
+def node_vector_db_store(state: PipelineState) -> PipelineState:
+    """
+    Agent 5: Persist embeddings to Qdrant Vector DB
+    """
+    try:
+        ensure_collection()
+        
+        embedding_packet = state["embedding_packet"]
+        if not embedding_packet or not embedding_packet.get("percept_id"):
+            return state
+        
+        percept_id = embedding_packet["percept_id"]
+        
+        with MEM_LOCK:
+            hydro_voxel = EMBEDDING_MEMORY.get(percept_id)
+        
+        if not hydro_voxel:
+            return state
+        
+        point = voxel_to_point(hydro_voxel)
+        upsert_points([point])
+        
+        state["embedding_packet"]["vector_stored"] = True
+        
+        logger.info(f"[AGENT5] ✅ Stored in Qdrant | point_id={point.id}")
+        state["completed_agents"].append("AGENT5")
+        return state
+        
+    except Exception as e:
+        state["errors"].append(f"AGENT5: {str(e)}")
+        logger.error(f"[AGENT5] ❌ Error: {e}")
+        return state
+
+def node_sensor_ingest(state: PipelineState) -> PipelineState:
+    """
+    Agent 1: Consume and preprocess sensor data from Kafka
+    (Separate from WhatsApp/Direct input - different data source)
+    """
+    try:
+        agent1_state = Agent1State(raw=None, clean=None)
+        agent1_state = consume_raw(agent1_state)
+        agent1_state = preprocess(agent1_state)
+        agent1_state = publish_clean(agent1_state)
+        
+        state["sensor_packet"] = {
+            "raw_data": agent1_state.get("raw"),
+            "cleaned_data": agent1_state.get("clean"),
+            "spike_event": None,
+            "semantic_event": None
+        }
+        
+        if agent1_state.get("clean"):
+            source_id = agent1_state["clean"].get("source_id", "unknown")
+            logger.info(f"[AGENT1] ✅ Sensor ingested | source_id={source_id}")
+            state["completed_agents"].append("AGENT1")
+        
+        return state
+        
+    except Exception as e:
+        state["errors"].append(f"AGENT1: {str(e)}")
+        logger.warning(f"[AGENT1] ⚠️ Sensor ingestion skipped: {e}")
+        return state
+
+def node_spike_detection(state: PipelineState) -> PipelineState:
+    """
+    Agent 2: Detect anomalies in sensor stream using Z-score
+    """
+    try:
+        sensor_packet = state["sensor_packet"]
+        if not sensor_packet or not sensor_packet.get("cleaned_data"):
+            return state
+        
+        cleaned_data = sensor_packet["cleaned_data"]
+        source_id = cleaned_data.get("source_id")
+        timestamp_str = cleaned_data.get("timestamp", "")
+        readings = cleaned_data.get("readings", {})
         
         try:
-            admin_client.create_topics(new_topics=topics, validate_only=False)
-            logger.info("✅ Created Kafka topics")
-        except TopicAlreadyExistsError:
-            logger.info("✅ Kafka topics already exist")
+            timestamp = parse_iso(timestamp_str)
+        except:
+            timestamp = time.time()
         
-        admin_client.close()
-        return True
+        # Update STM
+        history = STM[source_id]
+        if not history:
+            for metric, value in readings.items():
+                if value is not None:
+                    history.append((timestamp, value))
+            return state
         
-    except Exception as e:
-        logger.error("❌ Failed to create Kafka topics: %s", e)
-        return False
-
-def init_kafka_producer() -> Optional[KafkaProducer]:
-    """Initialize Kafka producer"""
-    try:
-        producer = KafkaProducer(
-            bootstrap_servers=config.KAFKA_BOOTSTRAP_SERVERS,
-            value_serializer=lambda v: json.dumps(v).encode("utf-8"),
-            key_serializer=lambda k: str(k).encode("utf-8") if k else None,
-            retries=5,
-            max_in_flight_requests_per_connection=5
-        )
-        logger.info("✅ Kafka producer initialized")
-        return producer
-    except Exception as e:
-        logger.error("❌ Failed to initialize Kafka producer: %s", e)
-        return None
-
-# =============================================================================
-# QDRANT SETUP
-# =============================================================================
-
-def init_qdrant_collection() -> bool:
-    """Initialize Qdrant collection with proper schema"""
-    logger.info("📊 Initializing Qdrant collection...")
-    
-    try:
-        client = QdrantClient(host=config.QDRANT_HOST, port=config.QDRANT_PORT)
-        state.qdrant_client = client
-        
-        # Check if collection exists
-        collections = client.get_collections().collections
-        collection_names = [c.name for c in collections]
-        
-        if "water_memory" in collection_names:
-            logger.info("✅ Qdrant collection 'water_memory' already exists")
-            return True
-        
-        # Create collection with multiple vectors (as per Agent 5 schema)
-        from qdrant_client.models import VectorParams, Distance
-        
-        client.create_collection(
-            collection_name="water_memory",
-            vectors_config={
-                "semantic_bind": VectorParams(size=384, distance=Distance.COSINE),
-                "sensor_dense": VectorParams(size=384, distance=Distance.COSINE),
-                "lexical_sparse": VectorParams(size=384, distance=Distance.COSINE),
-            }
-        )
-        
-        logger.info("✅ Created Qdrant collection 'water_memory'")
-        return True
-        
-    except Exception as e:
-        logger.error("❌ Failed to initialize Qdrant collection: %s", e)
-        return False
-
-# =============================================================================
-# SMTP VERIFICATION
-# =============================================================================
-
-def verify_smtp_connection() -> bool:
-    """Verify SMTP connection (without sending email)"""
-    logger.info("📧 Verifying SMTP connection...")
-    
-    try:
-        server = smtplib.SMTP(config.SMTP_HOST, config.SMTP_PORT, timeout=10)
-        server.starttls()
-        server.login(config.SMTP_USER, config.SMTP_PASSWORD)
-        server.quit()
-        logger.info("✅ SMTP connection verified")
-        return True
-    except Exception as e:
-        logger.error("❌ SMTP connection failed: %s", e)
-        logger.error("   Check SMTP credentials in .env")
-        return False
-
-# =============================================================================
-# FORECASTING PIPELINE
-# =============================================================================
-
-def run_forecasting_pipeline(data_limit: Optional[int] = None):
-    """
-    Run the complete forecasting pipeline:
-    CSV → Kafka → Preprocessing → Spike Detection → Embeddings → Qdrant → Forecasting → SMTP
-    """
-    logger.info("🚀 Starting Forecasting Pipeline...")
-    
-    # Import agents
-    try:
-        from agents.agent1_sensor_data_ingestion import run_producer, run_agent1_loop
-        from agents.agent2 import run_agent2
-        from agents.agent5 import run_system as run_agent5_system
-        from agents.agent6_forecasting import forecast
-        from agents.agent_10_smtp import check_all_sources
-    except ImportError as e:
-        logger.error("❌ Failed to import agents: %s", e)
-        logger.error("   Make sure all agent files are present in the agents/ directory")
-        return
-    
-    # Stage 1: Data Producer
-    logger.info("📤 Stage 1: Producing data from water.csv to Kafka...")
-    producer_thread = threading.Thread(target=run_producer, daemon=True, name="Producer")
-    producer_thread.start()
-    state.threads.append(producer_thread)
-    
-    # Wait for producer to start
-    time.sleep(3)
-    
-    # Stage 2: Preprocessing (Agent 1)
-    logger.info("🔧 Stage 2: Starting preprocessing agent...")
-    preprocess_thread = threading.Thread(target=run_agent1_loop, daemon=True, name="Preprocessor")
-    preprocess_thread.start()
-    state.threads.append(preprocess_thread)
-    
-    # Stage 3: Spike Detection (Agent 2)
-    logger.info("📊 Stage 3: Starting spike detection agent...")
-    spike_thread = threading.Thread(target=run_agent2, daemon=True, name="SpikeDetector")
-    spike_thread.start()
-    state.threads.append(spike_thread)
-    
-    # Stage 4 & 5: Embeddings + Memory (Agent 4 & 5 combined)
-    logger.info("🧠 Stage 4-5: Starting embedding and memory agents...")
-    memory_thread = threading.Thread(target=run_agent5_system, daemon=True, name="MemorySystem")
-    memory_thread.start()
-    state.threads.append(memory_thread)
-    
-    # Monitor progress
-    logger.info("⏳ Processing data... (Press Ctrl+C to stop)")
-    logger.info("=" * 80)
-    
-    forecast_counter = 0
-    last_forecast_time = time.time()
-    FORECAST_INTERVAL = 30  # Run forecasting every 30 seconds
-    
-    try:
-        while state.running:
-            time.sleep(5)
-            
-            # Periodic status update
-            if forecast_counter % 6 == 0:  # Every 30 seconds
-                logger.info("📈 Pipeline Status:")
-                logger.info("   Threads alive: %d/%d", 
-                          sum(1 for t in state.threads if t.is_alive()), 
-                          len(state.threads))
-                logger.info("   Stats: %s", json.dumps(state.stats, indent=2))
-            
-            # Check if we should run forecasting and alerts
-            current_time = time.time()
-            if current_time - last_forecast_time >= FORECAST_INTERVAL:
-                last_forecast_time = current_time
+        # Detect spikes
+        anomalies = []
+        if len(history) >= MIN_POINTS:
+            for metric, current_val in readings.items():
+                if current_val is None:
+                    continue
                 
-                # Stage 6: Forecasting (periodically)
-                logger.info("🔮 Stage 6: Running forecasting for 'Bay' site...")
-                try:
-                    result = forecast("Bay", window="24h", horizon="6h", mode="risk+evidence")
-                    state.stats["forecasts_made"] += 1
+                history_vals = [r.get(metric) for (_, r) in history 
+                               if r.get(metric) is not None]
+                
+                if len(history_vals) >= MIN_POINTS:
+                    baseline = history_vals[:-1] if len(history_vals) > 1 else history_vals
+                    mean, std, z = compute_z(baseline, float(current_val))
                     
-                    risk_score = result.get("risk_score", 0)
-                    risk_level_str = result.get("risk_level", "unknown")
-                    
-                    logger.info("   Risk Score: %.2f (%s)", risk_score, risk_level_str)
-                    
-                    # Stage 7: SMTP Alerts (if high risk)
-                    if config.ENABLE_SMTP_ALERTS and risk_score > config.RISK_HIGH_THRESHOLD:
-                        logger.warning("⚠️  HIGH RISK DETECTED!")
-                        logger.info("📧 Stage 7: Sending SMTP alert...")
-                        try:
-                            check_all_sources()
-                            state.stats["emails_sent"] += 1
-                            logger.info("✅ Alert email sent successfully")
-                        except Exception as email_error:
-                            logger.error("❌ Failed to send email: %s", email_error)
-                            state.stats["errors"] += 1
-                        
-                except Exception as e:
-                    logger.error("❌ Forecasting error: %s", e)
-                    state.stats["errors"] += 1
+                    if abs(z) >= Z_THRESH:
+                        anomalies.append({
+                            "metric": metric,
+                            "value": float(current_val),
+                            "z_score": z,
+                            "mean": mean,
+                            "std": std
+                        })
+        
+        if anomalies:
+            spike = max(anomalies, key=lambda x: abs(x["z_score"]))
+            semantic_text = build_semantic_text(
+                source_id, spike["metric"], spike["value"], spike["z_score"]
+            )
             
-            forecast_counter += 1
+            state["sensor_packet"]["spike_event"] = spike
+            state["sensor_packet"]["semantic_event"] = {"text": semantic_text}
             
-    except KeyboardInterrupt:
-        logger.info("🛑 Stopping forecasting pipeline...")
-    finally:
-        logger.info("=" * 80)
-        logger.info("📊 Final Statistics:")
-        logger.info(json.dumps(state.stats, indent=2))
-
-
-# =============================================================================
-# CHATBOT PIPELINE
-# =============================================================================
-
-def test_chatbot(query: str, modality: str = "text"):
-    """
-    Test the chatbot pipeline with a query
-    
-    Args:
-        query: The user query
-        modality: Input type (text/image/video/audio)
-    """
-    logger.info("💬 Testing Chatbot Pipeline...")
-    logger.info("   Query: %s", query)
-    logger.info("   Modality: %s", modality)
-    
-    try:
-        from agents.qa_agent8 import build_qa_agent
+            logger.info(
+                f"[AGENT2] ✅ Spike detected | metric={spike['metric']} | z={spike['z_score']:.2f}"
+            )
+        else:
+            logger.info(f"[AGENT2] ℹ️  No spikes detected")
         
-        # Build and run QA agent
-        qa_agent = build_qa_agent()
-        
-        result = qa_agent.invoke({
-            "query": query,
-            "query_vector": None,
-            "policy": None,
-            "retrieved": [],
-            "evidence_by_modality": {},
-            "answer": None
-        })
-        
-        answer_data = result.get("answer", {})
-        
-        logger.info("✅ Chatbot Response:")
-        logger.info("   Answer: %s", answer_data.get("text", "No answer"))
-        logger.info("   Citations: %d", len(answer_data.get("citations", [])))
-        logger.info("   Media: %d items", len(answer_data.get("media", [])))
-        
-        state.stats["chatbot_queries"] += 1
-        return result
+        state["completed_agents"].append("AGENT2")
+        return state
         
     except Exception as e:
-        logger.error("❌ Chatbot error: %s", e)
-        import traceback
-        traceback.print_exc()
-        state.stats["errors"] += 1
-        return None
+        state["errors"].append(f"AGENT2: {str(e)}")
+        logger.warning(f"[AGENT2] ⚠️ Spike detection error: {e}")
+        return state
 
-# =============================================================================
-# MAIN ORCHESTRATOR
-# =============================================================================
+# ==================== CONDITIONAL ROUTING ====================
 
-def run_full_system(args):
-    """Run the complete Water Watch system"""
-    logger.info("=" * 80)
-    logger.info("🌊 Water Watch - End-to-End Integration System")
-    logger.info("=" * 80)
+def route_to_liquid_memory(state: PipelineState) -> str:
+    """
+    Conditional edge: Route to liquid memory retrieval if data available
+    """
+    has_embedding = (state["embedding_packet"] and 
+                     state["embedding_packet"].get("vector_stored"))
+    has_sensor = (state["sensor_packet"] and 
+                  state["sensor_packet"].get("cleaned_data"))
     
-    # Infrastructure verification
-    if not args.skip_docker_check:
-        if not verify_docker_services():
-            logger.error("❌ Docker services not available. Exiting.")
-            return False
-    
-    if not verify_environment():
-        logger.error("❌ Environment configuration invalid. Exiting.")
-        return False
-    
-    if not verify_data_file():
-        logger.error("❌ Data file not found. Exiting.")
-        return False
-    
-    # Setup
-    if not create_kafka_topics():
-        logger.error("❌ Failed to create Kafka topics. Exiting.")
-        return False
-    
-    if not init_qdrant_collection():
-        logger.error("❌ Failed to initialize Qdrant. Exiting.")
-        return False
-    
-    if config.ENABLE_SMTP_ALERTS and not args.dry_run:
-        if not verify_smtp_connection():
-            logger.warning("⚠️  SMTP verification failed. Email alerts will be disabled.")
-            config.ENABLE_SMTP_ALERTS = False
-    
-    # Dry run check
-    if args.dry_run:
-        logger.info("✅ Dry run complete. All systems verified.")
-        return True
-    
-    # Initialize Kafka producer
-    state.kafka_producer = init_kafka_producer()
-    if not state.kafka_producer:
-        logger.error("❌ Failed to initialize Kafka producer. Exiting.")
-        return False
-    
-    logger.info("=" * 80)
-    logger.info("✅ All systems initialized. Starting pipelines...")
-    logger.info("=" * 80)
-    
-    # Run based on mode
-    if args.mode in ["forecasting", "full"]:
-        run_forecasting_pipeline(data_limit=args.data_limit)
-    
-    if args.mode == "chatbot":
-        # Interactive chatbot mode
-        logger.info("💬 Chatbot mode. Enter queries (type 'exit' to quit):")
-        while state.running:
-            try:
-                query = input("\n🤔 You: ")
-                if query.lower() in ["exit", "quit"]:
-                    break
-                test_chatbot(query)
-            except EOFError:
-                break
-    
-    return True
-
-# =============================================================================
-# COMMAND LINE INTERFACE
-# =============================================================================
-
-def interactive_menu():
-    """Run interactive UI menu"""
-    while True:
-        print("\n" + "="*50)
-        print("🌊  Water Watch - System Control")
-        print("="*50)
-        print("1. 📈 Run Forecasting Pipeline (End-to-End)")
-        print("2. 💬 Start Chatbot Interface")
-        print("3. ❌ Exit")
-        print("-" * 50)
-        
-        choice = input("👉 Select an option (1-3): ").strip()
-        
-        if choice == "1":
-            print("\n🚀 Initializing Forecasting Pipeline...")
-            limit_input = input("   Limit rows? (Enter number or press Enter for all): ").strip()
-            data_limit = int(limit_input) if limit_input.isdigit() else None
-            
-            # Run initialization first
-            if not run_full_system(argparse.Namespace(
-                mode="forecasting", 
-                data_limit=data_limit, 
-                skip_docker_check=False, 
-                dry_run=False
-            )):
-                print("❌ Failed to start pipeline.")
-            
-        elif choice == "2":
-            print("\n💬 Starting Chatbot...")
-            # Initialize system first (Kafka/Qdrant checks)
-            if verify_docker_services() and verify_environment() and init_qdrant_collection():
-                 print("\n" + "="*40)
-                 print("🤖 Water Watch Chatbot")
-                 print("Type 'exit' to return to menu")
-                 print("="*40)
-                 
-                 while True:
-                    try:
-                        query = input("\n👤 User: ").strip()
-                        if query.lower() in ["exit", "quit", "menu"]:
-                            break
-                        if not query:
-                            continue
-                            
-                        # Default to text modality for now
-                        test_chatbot(query, modality="text")
-                        
-                    except KeyboardInterrupt:
-                        break
-            else:
-                 print("❌ System check failed. Please verify infrastructure.")
-
-        elif choice == "3":
-            print("👋 Exiting Water Watch...")
-            sys.exit(0)
-        else:
-            print("❌ Invalid option. Please try again.")
-
-def main():
-    """Main entry point"""
-    parser = argparse.ArgumentParser(
-        description="Water Watch End-to-End Integration System",
-        formatter_class=argparse.RawDescriptionHelpFormatter
-    )
-    
-    parser.add_argument(
-        "--mode",
-        choices=["forecasting", "chatbot", "full", "interactive"],
-        default="interactive",
-        help="Execution mode (default: interactive)"
-    )
-    
-    parser.add_argument(
-        "--data-limit",
-        type=int,
-        default=None,
-        help="Limit number of rows from CSV for testing"
-    )
-    
-    parser.add_argument(
-        "--skip-docker-check",
-        action="store_true",
-        help="Skip Docker service verification"
-    )
-    
-    parser.add_argument(
-        "--dry-run",
-        action="store_true",
-        help="Validate setup without processing data"
-    )
-    
-    args = parser.parse_args()
-    
-    # Set log level
-    logging.getLogger().setLevel(getattr(logging, config.LOG_LEVEL.upper()))
-    
-    if args.mode == "interactive":
-        interactive_menu()
+    if has_embedding or has_sensor:
+        logger.info("🔀 [ROUTING] Data ready → Liquid Memory Retrieval (Agent 7)")
+        return "liquid_memory"
     else:
-        # Run system standard way
-        success = run_full_system(args)
-        if success:
-            logger.info("✅ System completed successfully")
-            sys.exit(0)
-        else:
-            logger.error("❌ System failed")
-            sys.exit(1)
+        logger.warning("🔀 [ROUTING] No data available → End")
+        return "end"
 
-if __name__ == "__main__":
-    main()
+# ==================== AGENT 7: LIQUID MEMORY RETRIEVAL ====================
+
+def node_liquid_memory_retrieval(state: PipelineState) -> PipelineState:
+    """
+    Agent 7: LIQUID MEMORY RETRIEVAL (Central Hub)
+    Feeds Forecasting, QA/RAG, and Recommendations
+    """
+    try:
+        query_vector = None
+        if state["embedding_packet"] and state["embedding_packet"].get("embeddings"):
+            query_vector = state["embedding_packet"]["embeddings"].get("semantic_bind")
+        
+        if not query_vector:
+            logger.warning("[AGENT7] ⚠️ No query vector - skipping retrieval")
+            state["liquid_memory"] = {
+                "query_vector": None,
+                "retrieved_items": [],
+                "num_items": 0,
+                "avg_score": 0.0
+            }
+            state["completed_agents"].append("AGENT7")
+            return state
+        
+        retriever = LiquidRetriever()
+        
+        # Step 1: Hybrid search with liquid memory formula
+        results = retriever.retrieve_with_liquid_memory(
+            query_vector=query_vector,
+            vector_name=VECTOR_FALLBACK,
+            alpha=0.7,
+            beta=0.3,
+            top_k=SIM_TOPK,
+            decay_scale="14d",
+            decay_factor=0.5
+        )
+        
+        # Step 2: Filter by similarity gate
+        filtered = [r for r in results if r["score"] >= SIM_SEARCH_GATE]
+        
+        # Step 3: MMR reranking
+        reranked = retriever.mmr_reranking(
+            query_vector=query_vector,
+            candidates=filtered,
+            lambda_mult=0.5,
+            k=SIM_TOPK
+        )
+        
+        # Calculate metrics
+        retrieval_scores = [r["score"] for r in reranked]
+        avg_score = np.mean(retrieval_scores) if retrieval_scores else 0.0
+        
+        state["liquid_memory"] = {
+            "query_vector": query_vector,
+            "retrieved_items": reranked,
+            "num_items": len(reranked),
+            "avg_score": float(avg_score)
+        }
+        
+        logger.info(
+            f"[AGENT7] ✅ Liquid Memory Retrieval | retrieved={len(reranked)} items | "
+            f"avg_score={avg_score:.3f}"
+        )
+        logger.info(
+            f"[AGENT7] 📊 CENTRAL HUB → Feeding Forecast, QA/RAG, Recommendations"
+        )
+        
+        state["completed_agents"].append("AGENT7")
+        return state
+        
+    except Exception as e:
+        state["errors"].append(f"AGENT7: {str(e)}")
+        logger.error(f"[AGENT7] ❌ Error: {e}")
+        state["liquid_memory"] = {
+            "query_vector": None,
+            "retrieved_items": [],
+            "num_items": 0,
+            "avg_score": 0.0
+        }
+        return state
+
+# ==================== DOWNSTREAM ANALYSIS ====================
+
+def node_forecasting(state: PipelineState) -> PipelineState:
+    """
+    Agent 6: Risk Forecasting (fed by Agent 7 retrieval)
+    """
+    try:
+        liquid_memory = state["liquid_memory"]
+        if not liquid_memory or liquid_memory.get("num_items") == 0:
+            logger.info("[AGENT6] ℹ️  No retrieval results - skipping forecast")
+            return state
+        
+        sensor_packet = state["sensor_packet"]
+        if not sensor_packet or not sensor_packet.get("cleaned_data"):
+            return state
+        
+        source_id = sensor_packet["cleaned_data"].get("source_id")
+        if not source_id:
+            return state
+        
+        forecast_result = forecast(
+            well_id=source_id,
+            window=DEFAULT_WINDOW,
+            horizon=DEFAULT_HORIZON,
+            mode=DEFAULT_MODE
+        )
+        
+        if not state["analysis"]:
+            state["analysis"] = {
+                "forecast_result": None,
+                "qa_result": None,
+                "recommendations": None,
+                "priority_actions": None,
+            }
+        
+        state["analysis"]["forecast_result"] = forecast_result
+        
+        risk_level = forecast_result.get("risk_forecast", {}).get("risk_level", "UNKNOWN")
+        
+        logger.info(f"[AGENT6] ✅ Forecast complete | risk_level={risk_level}")
+        state["completed_agents"].append("AGENT6")
+        return state
+        
+    except Exception as e:
+        state["errors"].append(f"AGENT6: {str(e)}")
+        logger.warning(f"[AGENT6] ⚠️ Forecasting error: {e}")
+        return state
+
+def node_qa_rag(state: PipelineState) -> PipelineState:
+    """
+    Agent 8: QA/RAG Chatbot (fed by Agent 7 retrieval)
+    """
+    try:
+        liquid_memory = state["liquid_memory"]
+        if not liquid_memory or liquid_memory.get("num_items") == 0:
+            logger.info("[AGENT8] ℹ️  No retrieval results - skipping QA")
+            return state
+        
+        user_input = state["user_input"]
+        if not user_input or user_input["modality"] != InputModality.TEXT:
+            logger.info("[AGENT8] ℹ️  Skipping QA (non-text input)")
+            return state
+        
+        query = user_input.get("content")
+        if not query:
+            return state
+        
+        retrieved_context = liquid_memory.get("retrieved_items", [])[:3]
+        context_text = "\n".join([
+            f"- {item.get('payload', {}).get('raw_ref', {})}"
+            for item in retrieved_context
+        ])
+        
+        prompt = f"""
+Based on these similar water quality incidents:
+
+{context_text}
+
+Answer: {query}
+
+Provide concise, evidence-based answer.
+"""
+        
+        response = llm.generate_content(prompt)
+        qa_answer = response.text if response else "Unable to generate answer"
+        
+        if not state["analysis"]:
+            state["analysis"] = {
+                "forecast_result": None,
+                "qa_result": None,
+                "recommendations": None,
+                "priority_actions": None,
+            }
+        
+        state["analysis"]["qa_result"] = {
+            "query": query,
+            "answer": qa_answer,
+            "evidence_count": len(retrieved_context),
+            "avg_evidence_score": liquid_memory.get("avg_score", 0.0)
+        }
+        
+        logger.info(f"[AGENT8] ✅ QA/RAG complete | evidence={len(retrieved_context)}")
+        state["completed_agents"].append("AGENT8")
+        return state
+        
+    except Exception as e:
+        state["errors"].append(f"AGENT8: {str(e)}")
+        logger.warning(f"[AGENT8] ⚠️ QA/RAG error: {e}")
+        return state
+
+def node_recommendations(state: PipelineState) -> PipelineState:
+    """
+    Agent 9: Recommendations Engine (fed by Agent 7 + Agent 6)
+    """
+    try:
+        liquid_memory = state["liquid_memory"]
+        analysis = state["analysis"]
+        
+        if not liquid_memory or not analysis:
+            return state
+        
+        retrieved_items = liquid_memory.get("retrieved_items", [])
+        forecast_result = analysis.get("forecast_result")
+        
+        recommendations = []
+        priority_actions = []
+        
+        if forecast_result:
+            risk_forecast = forecast_result.get("risk_forecast", {})
+            risk_level = risk_forecast.get("risk_level")
+            
+            if risk_level == "HIGH":
+                recommendations.append({
+                    "recommendation": "🚨 IMMEDIATE ACTION: Contact water management team",
+                    "priority": "CRITICAL",
+                    "based_on": "High risk forecast"
+                })
+                priority_actions.append("Alert water management team immediately")
+                
+            elif risk_level == "MEDIUM":
+                recommendations.append({
+                    "recommendation": "⚠️ MEDIUM RISK: Schedule water quality testing",
+                    "priority": "HIGH",
+                    "based_on": "Medium risk forecast"
+                })
+                priority_actions.append("Schedule diagnostic tests")
+        
+        if retrieved_items:
+            recommendations.append({
+                "recommendation": f"📚 Review {len(retrieved_items)} similar historical incidents",
+                "priority": "MEDIUM",
+                "based_on": "Historical patterns"
+            })
+        
+        state["analysis"]["recommendations"] = recommendations
+        state["analysis"]["priority_actions"] = priority_actions
+        
+        logger.info(
+            f"[AGENT9] ✅ Recommendations generated | "
+            f"recs={len(recommendations)} | actions={len(priority_actions)}"
+        )
+        state["completed_agents"].append("AGENT9")
+        return state
+        
+    except Exception as e:
+        state["errors"].append(f"AGENT9: {str(e)}")
+        logger.warning(f"[AGENT9] ⚠️ Recommendations error: {e}")
+        return state
+
+# ==================== BUILD GRAPH ====================
+
+def build_pipeline_graph() -> StateGraph:
+    """
+    Build LangGraph with WhatsApp + Direct input + Sensor processing
+    Both input channels follow the same pipeline!
+    """
+    graph = StateGraph(PipelineState)
+    
+    # Entry point
+    graph.add_node("input", node_user_input)
+    graph.set_entry_point("input")
+    
+    # Parallel paths A & B
+    graph.add_node("perception", node_perception_embedding)
+    graph.add_node("embed_store", node_embedding_memory_store)
+    graph.add_node("vector_store", node_vector_db_store)
+    
+    graph.add_node("sensor_ingest", node_sensor_ingest)
+    graph.add_node("spike_detect", node_spike_detection)
+    
+    # Central Hub
+    graph.add_node("liquid_memory", node_liquid_memory_retrieval)
+    
+    # Downstream Analysis
+    graph.add_node("forecast", node_forecasting)
+    graph.add_node("qa_rag", node_qa_rag)
+    graph.add_node("recommend", node_recommendations)
+    
+    # ========== EDGES ==========
+    # Split inputs
+    graph.add_edge("input", "perception")
+    graph.add_edge("input", "sensor_ingest")
+    
+    # Path A: User content (both direct and WhatsApp)
+    graph.add_edge("perception", "embed_store")
+    graph.add_edge("embed_store", "vector_store")
+    
+    # Path B: Sensor stream
+    graph.add_edge("sensor_ingest", "spike_detect")
+    
+    # Convergence
+    graph.add_conditional_edges(
+        "vector_store",
+        route_to_liquid_memory,
+        {"liquid_memory": "liquid_memory", "end": END}
+    )
+    
+    graph.add_conditional_edges(
+        "spike_detect",
+        route_to_liquid_memory,
+        {"liquid_memory": "liquid_memory", "end": END}
+    )
+    
+    # Parallel analysis from Agent 7
+    graph.add_edge("liquid_memory", "forecast")
+    graph.add_edge("liquid_memory", "qa_rag")
+    graph.add_edge("forecast", "recommend")
+    graph.add_edge("qa_rag", "recommend")
+    
+    # End
+    graph.add_edge("recommend", END)
+    
+    return graph.compile()
+
+# ==================== EXECUTION ====================
+
+def run_pipeline(user_input: UserInputPacket) -> PipelineState:
+    """Execute the complete pipeline"""
+    logger.info("\n" + "=" * 90)
+    logger.info("🚀 WATERWATCH PIPELINE STARTED")
+    logger.info("=" * 90 + "\n")
+    
+    state = PipelineState(
+        pipeline_id=str(uuid.uuid4()),
+        created_at=time.time(),
+        user_input=user_input,
+        embedding_packet=None,
+        sensor_packet=None,
+        liquid_memory=None,
+        analysis=None,
+        completed_agents=[],
+        errors=[]
+    )
+    
+    graph = build_pipeline_graph()
+    result = graph.invoke(state)
+    
+    logger.info("\n" + "=" * 90)
+    logger.info("✅ PIPELINE COMPLETE")
+    logger.info("=" * 90)
+    logger.info(f"Agents Executed: {' → '.join(result['completed_agents'])}")
+    logger.info(f"Errors: {len(result['errors'])}")
+    logger.info("=" * 90 + "\n")
+    
+    return result
+
+# # ==================== EXAMPLE USAGE ====================
+
+# if __name__ == "__main__":
+#     # Example 1: Direct user input
+#     direct_input = UserInputPacket(
+#         input_id=str(uuid.uuid4()),
+#         channel=InputChannel.DIRECT,
+#         modality=InputModality.IMAGE,
+#         content="images/water_sample.jpg",
+#         source_id="well_001",
+#         metadata={"location": "site_A"}
+#     )
+    
+#     logger.info("\n" + "=" * 90)
+#     logger.info("EXAMPLE 1: DIRECT USER INPUT (IMAGE)")
+#     logger.info("=" * 90)
+#     result = run_pipeline(direct_input)
+    
+#     # Example 2: WhatsApp message (simulated)
+#     whatsapp_input = UserInputPacket(
+#         input_id=str(uuid.uuid4()),
+#         channel=InputChannel.WHATSAPP,
+#         modality=InputModality.TEXT,
+#         content="Water pH level reported as abnormal",
+#         source_id="whatsapp_geohash_123",
+#         metadata={
+#             "source_channel": "whatsapp",
+#             "sender": "field_agent",
+#             "chat_name": "Water Quality Reports"
+#         }
+#     )
+    
+#     logger.info("\n" + "=" * 90)
+#     logger.info("EXAMPLE 2: WHATSAPP INPUT (TEXT MESSAGE)")
+#     logger.info("=" * 90)
+#     result = run_pipeline(whatsapp_input)
+    
+#     # Pretty print results
+#     if result["analysis"]:
+#         print("\n" + "=" * 90)
+#         print("📊 RESULTS")
+#         print("=" * 90)
+        
+#         analysis = result["analysis"]
+#         if analysis.get("forecast_result"):
+#             print(f"⚠️  Risk Level: {analysis['forecast_result'].get('risk_forecast', {}).get('risk_level')}")
+        
+#         if analysis.get("recommendations"):
+#             print(f"💡 Recommendations: {len(analysis['recommendations'])}")
+#             for rec in analysis["recommendations"]:
+#                 print(f"  [{rec.get('priority')}] {rec.get('recommendation')}")
+        
+#         print("=" * 90 + "\n")

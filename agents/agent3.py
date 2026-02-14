@@ -23,43 +23,21 @@ import librosa
 import whisper
 
 
-# =============================
-# Device
-# =============================
-
 device = "cuda" if torch.cuda.is_available() else "cpu"
 
-
-# =============================
-# CLIP (Text + Image)
-# =============================
 
 CLIP_REPO = "openai/clip-vit-base-patch32"
 
 clip_processor = CLIPProcessor.from_pretrained(CLIP_REPO)
 clip_model = CLIPModel.from_pretrained(CLIP_REPO).to(device).eval()
 
-
-# =============================
-# CLAP (Audio)
-# =============================
-
 audio_model=whisper.load_model('base')
-
-
-# =============================
-# SPLADE++ (Lexical Sparse)
-# =============================
 
 SPLADE_REPO = "naver/splade-cocondenser-ensembledistil"
 
 splade_tokenizer = AutoTokenizer.from_pretrained(SPLADE_REPO)
 splade_model = AutoModelForMaskedLM.from_pretrained(SPLADE_REPO).to(device).eval()
 
-
-# =============================
-# Embedding Helpers
-# =============================
 
 @torch.no_grad()
 def embed_clip_text(text: str):
