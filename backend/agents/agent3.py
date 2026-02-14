@@ -31,7 +31,7 @@ CLIP_REPO = "openai/clip-vit-base-patch32"
 clip_processor = CLIPProcessor.from_pretrained(CLIP_REPO)
 clip_model = CLIPModel.from_pretrained(CLIP_REPO).to(device).eval()
 
-audio_model=whisper.load_model('base')
+audio_model=whisper.load_model('tiny')
 
 SPLADE_REPO = "naver/splade-cocondenser-ensembledistil"
 

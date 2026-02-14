@@ -19,12 +19,12 @@ from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
 # API routes
-from backend.api.routes.alerts import router as alerts_router
+from api.routes.alerts import router as alerts_router
 
 # Infrastructure services (for lifecycle)
-from backend.services.smtp_service import get_smtp_service
-from backend.services.redis_throttle import get_redis_client
-from backend.services.audit_logger import get_audit_logger
+from services.smtp_service import get_smtp_service
+from services.redis_throttle import get_redis_client
+from services.audit_logger import get_audit_logger
 
 
 # --------------------------------------------------

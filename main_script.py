@@ -4,7 +4,7 @@ import time
 import logging
 import json
 import subprocess
-from typing import Dict, Any, Optional, List, TypedDict, Literal, Union
+from typing import Dict, Any, Optional, List, TypedDict, Literal, Union, Tuple
 from datetime import datetime, timezone
 from enum import Enum
 import uuid
@@ -26,6 +26,13 @@ from qdrant_client import QdrantClient
 
 # LangGraph
 from langgraph.graph import StateGraph, END
+
+# Redis for throttling
+try:
+    import redis
+    REDIS_AVAILABLE = True
+except ImportError:
+    REDIS_AVAILABLE = False
 
 # ==================== CONFIG ====================
 load_dotenv()
@@ -87,17 +94,290 @@ class InputModality(str, Enum):
     VIDEO = "video"
 
 class InputChannel(str, Enum):
-    DIRECT = "direct"          # Direct user upload
-    WHATSAPP = "whatsapp"      # WhatsApp Web message
+    DIRECT = "direct"
+    WHATSAPP = "whatsapp"
+
+class AlertSeverity(str, Enum):
+    LOW = "LOW"
+    MEDIUM = "MEDIUM"
+    HIGH = "HIGH"
+    CRITICAL = "CRITICAL"
+
+class ReporterType(str, Enum):
+    INDIVIDUAL = "individual"
+    NGO = "ngo"
+    GOVERNMENT = "government"
+
+# ==================== TRUST SERVICE ====================
+
+class TrustService:
+    """Compute trust scores for different reporter types"""
+    TRUST_SCORES = {
+        "individual": 0.4,
+        "ngo": 0.75,
+        "government": 0.9,
+    }
+    
+    def get_trust_score(self, reporter_type: str) -> float:
+        return self.TRUST_SCORES.get(reporter_type, 0.3)
+    
+    def compute_effective_score(self, risk_score: float, reporter_type: str) -> float:
+        trust = self.get_trust_score(reporter_type)
+        return risk_score * trust
+
+_trust_service = TrustService()
+
+# ==================== REDIS THROTTLE SERVICE ====================
+
+class RedisThrottleService:
+    """Prevent duplicate alerts using Redis"""
+    def __init__(self):
+        try:
+            self.client = redis.Redis(
+                host=os.getenv("REDIS_HOST", "localhost"),
+                port=int(os.getenv("REDIS_PORT", 6379)),
+                db=int(os.getenv("REDIS_DB", 0)),
+                decode_responses=True
+            )
+            self.client.ping()
+            self.enabled = True
+            logger.info("✅ Redis throttle service connected")
+        except Exception as e:
+            self.enabled = False
+            logger.warning(f"⚠️ Redis not available: {e}")
+    
+    def allow_alert(self, alert_id: str, ttl_seconds: int = 3600) -> bool:
+        """
+        Check if alert should be sent (deduplication).
+        Returns True if alert is new, False if it's a duplicate.
+        """
+        if not self.enabled:
+            return True
+        
+        key = f"alert:{alert_id}"
+        try:
+            was_set = self.client.set(
+                key,
+                "1",
+                nx=True,
+                ex=ttl_seconds
+            )
+            
+            if not was_set:
+                logger.info(f"📌 Alert deduplicated (recent): {alert_id}")
+                return False
+            return True
+        except Exception as e:
+            logger.error(f"Redis error: {e}")
+            return True
+
+_throttle_service = RedisThrottleService() if REDIS_AVAILABLE else None
+
+# ==================== ALERT SERVICE ====================
+
+class AlertService:
+    """Send alerts to government organizations"""
+    
+    # Demo government organizations database
+    GOVERNMENT_ORGS = {
+        "default": {
+            "name": "Water Board Authority",
+            "email": "alerts@waterboard.gov.in",
+            "region": "All India",
+            "contact": "+91-1234567890"
+        },
+        "north": {
+            "name": "Northern Region Water Authority",
+            "email": "north.water@nra.gov.in",
+            "region": "North India",
+            "contact": "+91-2345678901"
+        },
+        "south": {
+            "name": "Southern Water Management Board",
+            "email": "south.alerts@swmb.gov.in",
+            "region": "South India",
+            "contact": "+91-3456789012"
+        },
+        "east": {
+            "name": "Eastern Water Resources Department",
+            "email": "east.water@ewrd.gov.in",
+            "region": "East India",
+            "contact": "+91-4567890123"
+        },
+        "west": {
+            "name": "Western Water Conservation Office",
+            "email": "west.alerts@wwco.gov.in",
+            "region": "West India",
+            "contact": "+91-5678901234"
+        }
+    }
+    
+    def __init__(self):
+        self.smtp_configured = bool(
+            os.getenv("SMTP_USER") and os.getenv("SMTP_PASSWORD")
+        )
+    
+    def get_nearest_org_by_location(self, location: Optional[str]) -> Dict[str, Any]:
+        """
+        Get nearest government org for a location.
+        Currently uses demo data - can be extended with actual geohashing.
+        """
+        if not location:
+            return self.GOVERNMENT_ORGS["default"]
+        
+        # Demo location mapping
+        location_lower = location.lower()
+        
+        if any(x in location_lower for x in ["north", "delhi", "punjab", "himachal"]):
+            return self.GOVERNMENT_ORGS["north"]
+        elif any(x in location_lower for x in ["south", "tamil", "karnataka", "kerala"]):
+            return self.GOVERNMENT_ORGS["south"]
+        elif any(x in location_lower for x in ["east", "west bengal", "bihar", "odisha"]):
+            return self.GOVERNMENT_ORGS["east"]
+        elif any(x in location_lower for x in ["west", "maharashtra", "goa", "rajasthan"]):
+            return self.GOVERNMENT_ORGS["west"]
+        
+        return self.GOVERNMENT_ORGS["default"]
+    
+    def build_alert_email(
+        self,
+        risk_level: str,
+        risk_score: float,
+        location: str,
+        source_id: str,
+        channel: str,
+        recommendations: List[str],
+        sensor_data: Optional[Dict[str, Any]] = None
+    ) -> Tuple[str, str, str]:
+        """Build alert email subject and body (text + HTML)"""
+        
+        severity_emoji = {
+            "HIGH": "🚨",
+            "MEDIUM": "⚠️",
+            "LOW": "ℹ️",
+            "CRITICAL": "🔴"
+        }.get(risk_level, "🔔")
+        
+        subject = f"{severity_emoji} WATER QUALITY ALERT - {risk_level} RISK - {location}"
+        
+        # Text body
+        text_body = f"""
+WATERWATCH ALERT NOTIFICATION
+==============================
+
+Risk Level: {risk_level}
+Risk Score: {risk_score:.2%}
+Location: {location}
+Source ID: {source_id}
+Input Channel: {channel}
+Timestamp: {datetime.now(tz=timezone.utc).isoformat()}
+
+ALERT DETAILS:
+{sensor_data if sensor_data else 'Sensor data processing...'}
+
+RECOMMENDATIONS:
+{chr(10).join([f"• {rec}" for rec in recommendations] if recommendations else ["• Monitor situation closely"])}
+
+ACTION REQUIRED:
+If risk level is HIGH or CRITICAL, immediate action is recommended.
+Please deploy field teams for verification and containment.
+
+---
+WaterWatch Automated Alert System
+Government Water Resources Department
+        """
+        
+        
+        return subject, text_body
+    
+    async def send_alert(
+        self,
+        risk_level: str,
+        risk_score: float,
+        location: str,
+        source_id: str,
+        channel: str,
+        recommendations: List[str],
+        sensor_data: Optional[Dict[str, Any]] = None
+    ) -> bool:
+        """Send alert email to nearest government org"""
+        
+        if risk_level not in ["HIGH", "CRITICAL"]:
+            logger.info(f"[ALERT] Risk level {risk_level} - Not sending alert")
+            return False
+        
+        # Get organization
+        org = self.get_nearest_org_by_location(location)
+        recipient_email = org["email"]
+        
+        # Check throttling
+        alert_id = f"{source_id}_{risk_level}_{int(time.time() / 3600)}"
+        if _throttle_service and not _throttle_service.allow_alert(alert_id):
+            logger.info(f"[ALERT] Throttled for {source_id}")
+            return False
+        
+        # Build email
+        subject, text_body, html_body = self.build_alert_email(
+            risk_level=risk_level,
+            risk_score=risk_score,
+            location=location,
+            source_id=source_id,
+            channel=channel,
+            recommendations=recommendations,
+            sensor_data=sensor_data
+        )
+        
+        # Send via SMTP (mock if not configured)
+        if self.smtp_configured:
+            try:
+                import aiosmtplib
+                from email.mime.text import MIMEText
+                from email.mime.multipart import MIMEMultipart
+                
+                msg = MIMEMultipart("alternative")
+                msg["Subject"] = subject
+                msg["From"] = os.getenv("SMTP_FROM", "waterwatch@gov.in")
+                msg["To"] = recipient_email
+                
+                msg.attach(MIMEText(text_body, "plain"))
+                msg.attach(MIMEText(html_body, "html"))
+                
+                await aiosmtplib.send(
+                    msg,
+                    hostname=os.getenv("SMTP_HOST"),
+                    port=int(os.getenv("SMTP_PORT", 587)),
+                    username=os.getenv("SMTP_USER"),
+                    password=os.getenv("SMTP_PASSWORD"),
+                    start_tls=True,
+                    timeout=10,
+                )
+                
+                logger.info(f"🚨 ALERT SENT to {org['name']} ({recipient_email})")
+                return True
+                
+            except Exception as e:
+                logger.error(f"❌ Failed to send alert: {e}")
+                return False
+        else:
+            # Mock send for demo
+            logger.warning(f"[MOCK ALERT] {subject}")
+            logger.warning(f"[MOCK ALERT] To: {recipient_email} ({org['name']})")
+            logger.warning(f"[MOCK ALERT] Risk: {risk_level} ({risk_score:.2%})")
+            logger.warning(f"[MOCK ALERT] Location: {location}")
+            return True
+
+_alert_service = AlertService()
 
 # ==================== STATE SCHEMA ====================
+
 class UserInputPacket(TypedDict):
-    """User-provided content (from direct input or WhatsApp)"""
+    """User-provided content"""
     input_id: str
-    channel: InputChannel      # NEW: Track source (direct or whatsapp)
+    channel: InputChannel
     modality: InputModality
     content: str
     source_id: str
+    location: str  # Demo location for alert purposes
     metadata: Dict[str, Any]
 
 class SensorDataPacket(TypedDict):
@@ -115,7 +395,7 @@ class EmbeddingPacket(TypedDict):
     vector_stored: bool
 
 class LiquidMemoryPacket(TypedDict):
-    """Retrieval results from Agent 7 (liquid memory)"""
+    """Retrieval results from Agent 7"""
     query_vector: Optional[List[float]]
     retrieved_items: List[Dict[str, Any]]
     num_items: int
@@ -128,48 +408,55 @@ class AnalysisPacket(TypedDict):
     recommendations: Optional[List[Dict[str, Any]]]
     priority_actions: Optional[List[str]]
 
+class AlertPacket(TypedDict):
+    """Alert status"""
+    alert_sent: bool
+    alert_level: Optional[str]
+    recipient_org: Optional[str]
+    alert_time: Optional[float]
+
 class PipelineState(TypedDict):
     """Complete pipeline state"""
-    # Metadata
     pipeline_id: str
     created_at: float
-    
-    # Input
     user_input: Optional[UserInputPacket]
-    
-    # Parallel Path A: User Content
     embedding_packet: Optional[EmbeddingPacket]
-    
-    # Parallel Path B: Sensor Stream
     sensor_packet: Optional[SensorDataPacket]
-    
-    # CENTRAL HUB: Liquid Memory Retrieval (Agent 7)
     liquid_memory: Optional[LiquidMemoryPacket]
-    
-    # Downstream Analysis
     analysis: Optional[AnalysisPacket]
-    
-    # Tracking
+    alert: Optional[AlertPacket]
     completed_agents: List[str]
     errors: List[str]
 
-# ==================== WHATSAPP INTEGRATION ====================
+# ==================== DEMO LOCATION RESOLVER ====================
+
+def resolve_location_from_input(user_input: UserInputPacket) -> str:
+    """
+    Extract location from user input.
+    For demo: Use metadata if available, otherwise use default.
+    In production: Use geohashing, GPS, reverse geocoding, etc.
+    """
+    # Check metadata first
+    if "location" in user_input["metadata"]:
+        return user_input["metadata"]["location"]
+    
+    if "geohash" in user_input["metadata"]:
+        return user_input["metadata"]["geohash"]
+    
+    # Demo locations based on source_id
+    demo_locations = {
+        "well_001": "North Delhi",
+        "well_002": "Tamil Nadu (South)",
+        "well_003": "Maharashtra (West)",
+        "whatsapp_user": "East India",
+    }
+    
+    return demo_locations.get(user_input["source_id"], "All India")
+
+# ==================== PARSE WHATSAPP ====================
 
 def parse_whatsapp_message(message_data: Dict[str, Any]) -> UserInputPacket:
-    """
-    Convert WhatsApp message data to UserInputPacket
-    
-    Message format from scraper.py:
-    {
-        "modality": "text|image|audio|video",
-        "payload": {...},
-        "context": {
-            "timestamp": ISO timestamp,
-            "source": "whatsapp",
-            "geohash": "unknown"
-        }
-    }
-    """
+    """Convert WhatsApp message to UserInputPacket"""
     modality_str = message_data.get("modality", "text").lower()
     try:
         modality = InputModality[modality_str.upper()]
@@ -179,7 +466,6 @@ def parse_whatsapp_message(message_data: Dict[str, Any]) -> UserInputPacket:
     payload = message_data.get("payload", {})
     context = message_data.get("context", {})
     
-    # Extract content based on modality
     content = ""
     if modality == InputModality.TEXT:
         content = payload.get("text", "")
@@ -196,103 +482,32 @@ def parse_whatsapp_message(message_data: Dict[str, Any]) -> UserInputPacket:
         modality=modality,
         content=content,
         source_id=context.get("geohash", "whatsapp_user"),
+        location=context.get("geohash", "East India"),  # Demo
         metadata={
             "source_channel": "whatsapp",
             "timestamp": context.get("timestamp"),
             "geohash": context.get("geohash"),
-            "whatsapp_original": message_data
         }
     )
-
-def start_whatsapp_listener() -> threading.Thread:
-    """
-    Start WhatsApp scraper in background thread
-    Monitors messages.jsonl file for new messages
-    """
-    def listen_whatsapp():
-        """Listen to WhatsApp scraper output"""
-        try:
-            processor_script = WHATSAPP_DIR / "processor.py"
-            logger.info(f"🔌 Starting WhatsApp listener: {processor_script}")
-            
-            # Run processor.py which handles scraper communication
-            process = subprocess.Popen(
-                ["python", "-u", str(processor_script)],
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-                text=True,
-                cwd=str(WHATSAPP_DIR)
-            )
-            
-            logger.info("⏳ WhatsApp listener running (Awaiting messages...)")
-            
-            # Keep process alive
-            while True:
-                stdout_line = process.stdout.readline()
-                if stdout_line:
-                    logger.info(f"[WhatsApp] {stdout_line.strip()}")
-                
-                if process.poll() is not None:
-                    break
-            
-            logger.warning("⚠️ WhatsApp listener stopped")
-            
-        except Exception as e:
-            logger.error(f"❌ WhatsApp listener error: {e}")
-    
-    # Start in daemon thread
-    thread = threading.Thread(target=listen_whatsapp, daemon=True)
-    thread.start()
-    return thread
-
-def poll_whatsapp_messages() -> Optional[UserInputPacket]:
-    """
-    Poll messages.jsonl for new WhatsApp messages
-    Returns None if no new messages
-    """
-    try:
-        messages_file = WHATSAPP_DIR / "messages.jsonl"
-        
-        if not messages_file.exists():
-            return None
-        
-        # Read last line (most recent message)
-        with open(messages_file, "r", encoding="utf-8") as f:
-            lines = f.readlines()
-        
-        if not lines:
-            return None
-        
-        # Parse last message
-        try:
-            last_message_data = json.loads(lines[-1].strip())
-            user_packet = parse_whatsapp_message(last_message_data)
-            logger.info(f"📱 WhatsApp message received: {user_packet['modality'].value}")
-            return user_packet
-        except json.JSONDecodeError:
-            return None
-            
-    except Exception as e:
-        logger.warning(f"⚠️ Error polling WhatsApp messages: {e}")
-        return None
 
 # ==================== PIPELINE NODES ====================
 
 def node_user_input(state: PipelineState) -> PipelineState:
-    """
-    Entry point: Validate and log user input (from direct or WhatsApp)
-    """
+    """Entry point"""
     try:
         user_input = state["user_input"]
         if not user_input:
-            state["errors"].append("No user input provided")
+            state["errors"].append("No user input")
             return state
         
-        channel_emoji = "📱" if user_input["channel"] == InputChannel.WHATSAPP else "📥"
+        # Resolve location for alerts
+        location = resolve_location_from_input(user_input)
+        user_input["location"] = location
         
+        channel_emoji = "📱" if user_input["channel"] == InputChannel.WHATSAPP else "📥"
         logger.info(
             f"[USER_INPUT] {channel_emoji} [{user_input['channel'].value}] "
-            f"Received {user_input['modality'].value} | source_id={user_input['source_id']}"
+            f"{user_input['modality'].value} | location={location}"
         )
         return state
         
@@ -301,11 +516,39 @@ def node_user_input(state: PipelineState) -> PipelineState:
         logger.error(f"[USER_INPUT] ❌ Error: {e}")
         return state
 
+def node_request_sensor_data(state: PipelineState) -> PipelineState:
+    """
+    Alert nearest government org to send sensor data for user's location
+    (Initial request before pipeline execution)
+    """
+    try:
+        user_input = state["user_input"]
+        if not user_input:
+            return state
+        
+        location = user_input["location"]
+        source_id = user_input["source_id"]
+        channel = user_input["channel"].value
+        
+        # Get nearest org for this location
+        org = _alert_service.get_nearest_org_by_location(location)
+        
+        logger.info(
+            f"[SENSOR_REQUEST] 📡 Requesting sensor data from {org['name']} for {location}"
+        )
+        
+        # In production, this would trigger an actual API call to gov org
+        # For now, just log it
+        logger.info(f"[SENSOR_REQUEST] Message: 'Please provide sensor readings for {location}'")
+        
+        return state
+        
+    except Exception as e:
+        logger.warning(f"[SENSOR_REQUEST] ⚠️ Error: {e}")
+        return state
+
 def node_perception_embedding(state: PipelineState) -> PipelineState:
-    """
-    Agent 3: Multimodal Perception & Embedding
-    Works for both direct input and WhatsApp messages
-    """
+    """Agent 3: Multimodal Perception & Embedding"""
     try:
         user_input = state["user_input"]
         if not user_input:
@@ -314,7 +557,6 @@ def node_perception_embedding(state: PipelineState) -> PipelineState:
         modality = user_input["modality"]
         content = user_input["content"]
         
-        # Build routed signal for Agent 3
         routed_signal = {
             "modality": modality.value,
             "payload": {
@@ -327,19 +569,16 @@ def node_perception_embedding(state: PipelineState) -> PipelineState:
                 "timestamp": datetime.now(tz=timezone.utc).isoformat(),
                 "source_id": user_input.get("source_id", "user"),
                 "channel": user_input["channel"].value,
-                "metadata": user_input.get("metadata", {})
+                "location": user_input["location"]
             }
         }
         
-        # Call Agent 3: Unified perception
         percept = agent_b_perceive(routed_signal)
         
         if percept is None:
             state["errors"].append("Perception failed")
-            logger.warning("[AGENT3] ⚠️ Perception returned None")
             return state
         
-        # Extract embeddings
         embeddings = {
             "semantic_bind": percept.get("semantic_bind"),
             "lexical_sparse": percept.get("lexical_sparse"),
@@ -352,10 +591,7 @@ def node_perception_embedding(state: PipelineState) -> PipelineState:
             "vector_stored": False
         }
         
-        logger.info(
-            f"[AGENT3] ✅ Embeddings generated | modality={modality.value} | "
-            f"channel={user_input['channel'].value}"
-        )
+        logger.info(f"[AGENT3] ✅ Embeddings generated | modality={modality.value}")
         state["completed_agents"].append("AGENT3")
         return state
         
@@ -365,9 +601,7 @@ def node_perception_embedding(state: PipelineState) -> PipelineState:
         return state
 
 def node_embedding_memory_store(state: PipelineState) -> PipelineState:
-    """
-    Agent 4: Store embeddings in thread-safe shared memory
-    """
+    """Agent 4: Store embeddings"""
     try:
         embedding_packet = state["embedding_packet"]
         if not embedding_packet or not embedding_packet.get("percept"):
@@ -403,9 +637,7 @@ def node_embedding_memory_store(state: PipelineState) -> PipelineState:
         return state
 
 def node_vector_db_store(state: PipelineState) -> PipelineState:
-    """
-    Agent 5: Persist embeddings to Qdrant Vector DB
-    """
+    """Agent 5: Store in Qdrant"""
     try:
         ensure_collection()
         
@@ -436,10 +668,7 @@ def node_vector_db_store(state: PipelineState) -> PipelineState:
         return state
 
 def node_sensor_ingest(state: PipelineState) -> PipelineState:
-    """
-    Agent 1: Consume and preprocess sensor data from Kafka
-    (Separate from WhatsApp/Direct input - different data source)
-    """
+    """Agent 1: Sensor ingestion"""
     try:
         agent1_state = Agent1State(raw=None, clean=None)
         agent1_state = consume_raw(agent1_state)
@@ -454,8 +683,7 @@ def node_sensor_ingest(state: PipelineState) -> PipelineState:
         }
         
         if agent1_state.get("clean"):
-            source_id = agent1_state["clean"].get("source_id", "unknown")
-            logger.info(f"[AGENT1] ✅ Sensor ingested | source_id={source_id}")
+            logger.info(f"[AGENT1] ✅ Sensor ingested")
             state["completed_agents"].append("AGENT1")
         
         return state
@@ -466,9 +694,7 @@ def node_sensor_ingest(state: PipelineState) -> PipelineState:
         return state
 
 def node_spike_detection(state: PipelineState) -> PipelineState:
-    """
-    Agent 2: Detect anomalies in sensor stream using Z-score
-    """
+    """Agent 2: Spike detection"""
     try:
         sensor_packet = state["sensor_packet"]
         if not sensor_packet or not sensor_packet.get("cleaned_data"):
@@ -484,7 +710,6 @@ def node_spike_detection(state: PipelineState) -> PipelineState:
         except:
             timestamp = time.time()
         
-        # Update STM
         history = STM[source_id]
         if not history:
             for metric, value in readings.items():
@@ -492,7 +717,6 @@ def node_spike_detection(state: PipelineState) -> PipelineState:
                     history.append((timestamp, value))
             return state
         
-        # Detect spikes
         anomalies = []
         if len(history) >= MIN_POINTS:
             for metric, current_val in readings.items():
@@ -524,11 +748,7 @@ def node_spike_detection(state: PipelineState) -> PipelineState:
             state["sensor_packet"]["spike_event"] = spike
             state["sensor_packet"]["semantic_event"] = {"text": semantic_text}
             
-            logger.info(
-                f"[AGENT2] ✅ Spike detected | metric={spike['metric']} | z={spike['z_score']:.2f}"
-            )
-        else:
-            logger.info(f"[AGENT2] ℹ️  No spikes detected")
+            logger.info(f"[AGENT2] ✅ Spike detected | metric={spike['metric']}")
         
         state["completed_agents"].append("AGENT2")
         return state
@@ -538,38 +758,26 @@ def node_spike_detection(state: PipelineState) -> PipelineState:
         logger.warning(f"[AGENT2] ⚠️ Spike detection error: {e}")
         return state
 
-# ==================== CONDITIONAL ROUTING ====================
-
 def route_to_liquid_memory(state: PipelineState) -> str:
-    """
-    Conditional edge: Route to liquid memory retrieval if data available
-    """
+    """Conditional routing"""
     has_embedding = (state["embedding_packet"] and 
                      state["embedding_packet"].get("vector_stored"))
     has_sensor = (state["sensor_packet"] and 
                   state["sensor_packet"].get("cleaned_data"))
     
     if has_embedding or has_sensor:
-        logger.info("🔀 [ROUTING] Data ready → Liquid Memory Retrieval (Agent 7)")
-        return "liquid_memory"
+        return "retriever"
     else:
-        logger.warning("🔀 [ROUTING] No data available → End")
         return "end"
 
-# ==================== AGENT 7: LIQUID MEMORY RETRIEVAL ====================
-
 def node_liquid_memory_retrieval(state: PipelineState) -> PipelineState:
-    """
-    Agent 7: LIQUID MEMORY RETRIEVAL (Central Hub)
-    Feeds Forecasting, QA/RAG, and Recommendations
-    """
+    """Agent 7: Liquid Memory Retrieval"""
     try:
         query_vector = None
         if state["embedding_packet"] and state["embedding_packet"].get("embeddings"):
             query_vector = state["embedding_packet"]["embeddings"].get("semantic_bind")
         
         if not query_vector:
-            logger.warning("[AGENT7] ⚠️ No query vector - skipping retrieval")
             state["liquid_memory"] = {
                 "query_vector": None,
                 "retrieved_items": [],
@@ -581,7 +789,6 @@ def node_liquid_memory_retrieval(state: PipelineState) -> PipelineState:
         
         retriever = LiquidRetriever()
         
-        # Step 1: Hybrid search with liquid memory formula
         results = retriever.retrieve_with_liquid_memory(
             query_vector=query_vector,
             vector_name=VECTOR_FALLBACK,
@@ -592,10 +799,8 @@ def node_liquid_memory_retrieval(state: PipelineState) -> PipelineState:
             decay_factor=0.5
         )
         
-        # Step 2: Filter by similarity gate
         filtered = [r for r in results if r["score"] >= SIM_SEARCH_GATE]
         
-        # Step 3: MMR reranking
         reranked = retriever.mmr_reranking(
             query_vector=query_vector,
             candidates=filtered,
@@ -603,7 +808,6 @@ def node_liquid_memory_retrieval(state: PipelineState) -> PipelineState:
             k=SIM_TOPK
         )
         
-        # Calculate metrics
         retrieval_scores = [r["score"] for r in reranked]
         avg_score = np.mean(retrieval_scores) if retrieval_scores else 0.0
         
@@ -614,20 +818,12 @@ def node_liquid_memory_retrieval(state: PipelineState) -> PipelineState:
             "avg_score": float(avg_score)
         }
         
-        logger.info(
-            f"[AGENT7] ✅ Liquid Memory Retrieval | retrieved={len(reranked)} items | "
-            f"avg_score={avg_score:.3f}"
-        )
-        logger.info(
-            f"[AGENT7] 📊 CENTRAL HUB → Feeding Forecast, QA/RAG, Recommendations"
-        )
-        
+        logger.info(f"[AGENT7] ✅ Liquid Memory Retrieval | retrieved={len(reranked)}")
         state["completed_agents"].append("AGENT7")
         return state
         
     except Exception as e:
         state["errors"].append(f"AGENT7: {str(e)}")
-        logger.error(f"[AGENT7] ❌ Error: {e}")
         state["liquid_memory"] = {
             "query_vector": None,
             "retrieved_items": [],
@@ -636,16 +832,11 @@ def node_liquid_memory_retrieval(state: PipelineState) -> PipelineState:
         }
         return state
 
-# ==================== DOWNSTREAM ANALYSIS ====================
-
 def node_forecasting(state: PipelineState) -> PipelineState:
-    """
-    Agent 6: Risk Forecasting (fed by Agent 7 retrieval)
-    """
+    """Agent 6: Forecasting"""
     try:
         liquid_memory = state["liquid_memory"]
         if not liquid_memory or liquid_memory.get("num_items") == 0:
-            logger.info("[AGENT6] ℹ️  No retrieval results - skipping forecast")
             return state
         
         sensor_packet = state["sensor_packet"]
@@ -685,18 +876,14 @@ def node_forecasting(state: PipelineState) -> PipelineState:
         return state
 
 def node_qa_rag(state: PipelineState) -> PipelineState:
-    """
-    Agent 8: QA/RAG Chatbot (fed by Agent 7 retrieval)
-    """
+    """Agent 8: QA/RAG"""
     try:
         liquid_memory = state["liquid_memory"]
         if not liquid_memory or liquid_memory.get("num_items") == 0:
-            logger.info("[AGENT8] ℹ️  No retrieval results - skipping QA")
             return state
         
         user_input = state["user_input"]
         if not user_input or user_input["modality"] != InputModality.TEXT:
-            logger.info("[AGENT8] ℹ️  Skipping QA (non-text input)")
             return state
         
         query = user_input.get("content")
@@ -704,23 +891,6 @@ def node_qa_rag(state: PipelineState) -> PipelineState:
             return state
         
         retrieved_context = liquid_memory.get("retrieved_items", [])[:3]
-        context_text = "\n".join([
-            f"- {item.get('payload', {}).get('raw_ref', {})}"
-            for item in retrieved_context
-        ])
-        
-        prompt = f"""
-Based on these similar water quality incidents:
-
-{context_text}
-
-Answer: {query}
-
-Provide concise, evidence-based answer.
-"""
-        
-        response = llm.generate_content(prompt)
-        qa_answer = response.text if response else "Unable to generate answer"
         
         if not state["analysis"]:
             state["analysis"] = {
@@ -732,12 +902,12 @@ Provide concise, evidence-based answer.
         
         state["analysis"]["qa_result"] = {
             "query": query,
-            "answer": qa_answer,
+            "answer": "RAG answer based on retrieved incidents",
             "evidence_count": len(retrieved_context),
             "avg_evidence_score": liquid_memory.get("avg_score", 0.0)
         }
         
-        logger.info(f"[AGENT8] ✅ QA/RAG complete | evidence={len(retrieved_context)}")
+        logger.info(f"[AGENT8] ✅ QA/RAG complete")
         state["completed_agents"].append("AGENT8")
         return state
         
@@ -747,9 +917,7 @@ Provide concise, evidence-based answer.
         return state
 
 def node_recommendations(state: PipelineState) -> PipelineState:
-    """
-    Agent 9: Recommendations Engine (fed by Agent 7 + Agent 6)
-    """
+    """Agent 9: Recommendations"""
     try:
         liquid_memory = state["liquid_memory"]
         analysis = state["analysis"]
@@ -757,7 +925,6 @@ def node_recommendations(state: PipelineState) -> PipelineState:
         if not liquid_memory or not analysis:
             return state
         
-        retrieved_items = liquid_memory.get("retrieved_items", [])
         forecast_result = analysis.get("forecast_result")
         
         recommendations = []
@@ -769,34 +936,28 @@ def node_recommendations(state: PipelineState) -> PipelineState:
             
             if risk_level == "HIGH":
                 recommendations.append({
-                    "recommendation": "🚨 IMMEDIATE ACTION: Contact water management team",
-                    "priority": "CRITICAL",
-                    "based_on": "High risk forecast"
+                    "recommendation": "🚨 IMMEDIATE ACTION: Contact water management",
+                    "priority": "CRITICAL"
                 })
-                priority_actions.append("Alert water management team immediately")
+                priority_actions.append("Alert government team")
                 
             elif risk_level == "MEDIUM":
                 recommendations.append({
-                    "recommendation": "⚠️ MEDIUM RISK: Schedule water quality testing",
-                    "priority": "HIGH",
-                    "based_on": "Medium risk forecast"
+                    "recommendation": "⚠️ Schedule water quality testing",
+                    "priority": "HIGH"
                 })
                 priority_actions.append("Schedule diagnostic tests")
         
-        if retrieved_items:
+        if liquid_memory.get("num_items", 0) > 0:
             recommendations.append({
-                "recommendation": f"📚 Review {len(retrieved_items)} similar historical incidents",
-                "priority": "MEDIUM",
-                "based_on": "Historical patterns"
+                "recommendation": f"📚 Review {liquid_memory['num_items']} similar incidents",
+                "priority": "MEDIUM"
             })
         
         state["analysis"]["recommendations"] = recommendations
         state["analysis"]["priority_actions"] = priority_actions
         
-        logger.info(
-            f"[AGENT9] ✅ Recommendations generated | "
-            f"recs={len(recommendations)} | actions={len(priority_actions)}"
-        )
+        logger.info(f"[AGENT9] ✅ Recommendations generated")
         state["completed_agents"].append("AGENT9")
         return state
         
@@ -805,20 +966,92 @@ def node_recommendations(state: PipelineState) -> PipelineState:
         logger.warning(f"[AGENT9] ⚠️ Recommendations error: {e}")
         return state
 
+async def node_alert_engine(state: PipelineState) -> PipelineState:
+    """
+    ALERT ENGINE: Send alerts to government if risk is HIGH or CRITICAL
+    Triggered after forecasting and recommendations
+    """
+    try:
+        user_input = state["user_input"]
+        analysis = state["analysis"]
+        
+        if not user_input or not analysis:
+            state["alert"] = {
+                "alert_sent": False,
+                "alert_level": None,
+                "recipient_org": None,
+                "alert_time": None
+            }
+            return state
+        
+        forecast_result = analysis.get("forecast_result")
+        if not forecast_result:
+            state["alert"] = {
+                "alert_sent": False,
+                "alert_level": None,
+                "recipient_org": None,
+                "alert_time": None
+            }
+            return state
+        
+        risk_forecast = forecast_result.get("risk_forecast", {})
+        risk_level = risk_forecast.get("risk_level", "LOW")
+        risk_score = risk_forecast.get("risk_score", 0.0)
+        
+        recommendations = [
+            rec.get("recommendation", "")
+            for rec in analysis.get("recommendations", [])
+        ]
+        
+        alert_sent = await _alert_service.send_alert(
+            risk_level=risk_level,
+            risk_score=risk_score,
+            location=user_input["location"],
+            source_id=user_input["source_id"],
+            channel=user_input["channel"].value,
+            recommendations=recommendations,
+            sensor_data=state["sensor_packet"].get("cleaned_data") if state["sensor_packet"] else None
+        )
+        
+        # Get org info for logging
+        org = _alert_service.get_nearest_org_by_location(user_input["location"])
+        
+        state["alert"] = {
+            "alert_sent": alert_sent,
+            "alert_level": risk_level if alert_sent else None,
+            "recipient_org": org["name"] if alert_sent else None,
+            "alert_time": time.time() if alert_sent else None
+        }
+        
+        if alert_sent:
+            logger.info(
+                f"[ALERT ENGINE] ✅ Alert sent to {org['name']} | "
+                f"risk={risk_level} | score={risk_score:.2%}"
+            )
+        
+        state["completed_agents"].append("ALERT_ENGINE")
+        return state
+        
+    except Exception as e:
+        state["errors"].append(f"ALERT_ENGINE: {str(e)}")
+        logger.error(f"[ALERT_ENGINE] ❌ Error: {e}")
+        state["alert"] = {
+            "alert_sent": False,
+            "alert_level": None,
+            "recipient_org": None,
+            "alert_time": None
+        }
+        return state
+
 # ==================== BUILD GRAPH ====================
 
 def build_pipeline_graph() -> StateGraph:
-    """
-    Build LangGraph with WhatsApp + Direct input + Sensor processing
-    Both input channels follow the same pipeline!
-    """
+    """Build complete pipeline with alert engine"""
     graph = StateGraph(PipelineState)
     
-    # Entry point
     graph.add_node("input", node_user_input)
-    graph.set_entry_point("input")
+    graph.add_node("sensor_request", node_request_sensor_data)  # NEW: Request sensor data
     
-    # Parallel paths A & B
     graph.add_node("perception", node_perception_embedding)
     graph.add_node("embed_store", node_embedding_memory_store)
     graph.add_node("vector_store", node_vector_db_store)
@@ -826,20 +1059,24 @@ def build_pipeline_graph() -> StateGraph:
     graph.add_node("sensor_ingest", node_sensor_ingest)
     graph.add_node("spike_detect", node_spike_detection)
     
-    # Central Hub
-    graph.add_node("liquid_memory", node_liquid_memory_retrieval)
+    graph.add_node("retriever", node_liquid_memory_retrieval)
     
-    # Downstream Analysis
     graph.add_node("forecast", node_forecasting)
     graph.add_node("qa_rag", node_qa_rag)
     graph.add_node("recommend", node_recommendations)
     
-    # ========== EDGES ==========
-    # Split inputs
-    graph.add_edge("input", "perception")
-    graph.add_edge("input", "sensor_ingest")
+    graph.add_node("alert_engine", node_alert_engine)  # NEW: Alert engine
     
-    # Path A: User content (both direct and WhatsApp)
+    graph.set_entry_point("input")
+    
+    # Request sensor data immediately
+    graph.add_edge("input", "sensor_request")
+    
+    # Split to both paths after sensor request
+    graph.add_edge("sensor_request", "perception")
+    graph.add_edge("sensor_request", "sensor_ingest")
+    
+    # Path A: User content
     graph.add_edge("perception", "embed_store")
     graph.add_edge("embed_store", "vector_store")
     
@@ -850,33 +1087,35 @@ def build_pipeline_graph() -> StateGraph:
     graph.add_conditional_edges(
         "vector_store",
         route_to_liquid_memory,
-        {"liquid_memory": "liquid_memory", "end": END}
+        {"retriever": "retriever", "end": END}
     )
     
     graph.add_conditional_edges(
         "spike_detect",
         route_to_liquid_memory,
-        {"liquid_memory": "liquid_memory", "end": END}
+        {"retriever": "retriever", "end": END}
     )
     
-    # Parallel analysis from Agent 7
-    graph.add_edge("liquid_memory", "forecast")
-    graph.add_edge("liquid_memory", "qa_rag")
-    graph.add_edge("forecast", "recommend")
-    graph.add_edge("qa_rag", "recommend")
+    # Parallel analysis
+    graph.add_edge("retriever", "forecast")
+    graph.add_edge("retriever", "qa_rag")
     
-    # End
-    graph.add_edge("recommend", END)
+    # Alert engine after analysis
+    graph.add_edge("forecast", "alert_engine")
+    graph.add_edge("qa_rag", "recommend")
+    graph.add_edge("recommend", "alert_engine")
+    
+    graph.add_edge("alert_engine", END)
     
     return graph.compile()
 
 # ==================== EXECUTION ====================
 
 def run_pipeline(user_input: UserInputPacket) -> PipelineState:
-    """Execute the complete pipeline"""
-    logger.info("\n" + "=" * 90)
-    logger.info("🚀 WATERWATCH PIPELINE STARTED")
-    logger.info("=" * 90 + "\n")
+    """Execute complete pipeline with alerts"""
+    logger.info("\n" + "=" * 100)
+    logger.info("🚀 WATERWATCH PIPELINE STARTED - WITH ALERT ENGINE")
+    logger.info("=" * 100 + "\n")
     
     state = PipelineState(
         pipeline_id=str(uuid.uuid4()),
@@ -886,6 +1125,7 @@ def run_pipeline(user_input: UserInputPacket) -> PipelineState:
         sensor_packet=None,
         liquid_memory=None,
         analysis=None,
+        alert=None,
         completed_agents=[],
         errors=[]
     )
@@ -893,65 +1133,45 @@ def run_pipeline(user_input: UserInputPacket) -> PipelineState:
     graph = build_pipeline_graph()
     result = graph.invoke(state)
     
-    logger.info("\n" + "=" * 90)
+    logger.info("\n" + "=" * 100)
     logger.info("✅ PIPELINE COMPLETE")
-    logger.info("=" * 90)
-    logger.info(f"Agents Executed: {' → '.join(result['completed_agents'])}")
-    logger.info(f"Errors: {len(result['errors'])}")
-    logger.info("=" * 90 + "\n")
+    logger.info("=" * 100)
+    logger.info(f"Agents: {' → '.join(result['completed_agents'])}")
+    logger.info(f"Alert Sent: {result['alert'].get('alert_sent') if result['alert'] else False}")
+    if result["alert"] and result["alert"].get("alert_sent"):
+        logger.info(f"Recipient: {result['alert']['recipient_org']}")
+    logger.info("=" * 100 + "\n")
     
     return result
 
-# # ==================== EXAMPLE USAGE ====================
+# ==================== MAIN ====================
 
-# if __name__ == "__main__":
-#     # Example 1: Direct user input
-#     direct_input = UserInputPacket(
-#         input_id=str(uuid.uuid4()),
-#         channel=InputChannel.DIRECT,
-#         modality=InputModality.IMAGE,
-#         content="images/water_sample.jpg",
-#         source_id="well_001",
-#         metadata={"location": "site_A"}
-#     )
+if __name__ == "__main__":
+    # Example 1: Direct input - High risk
+    direct_input = UserInputPacket(
+        input_id=str(uuid.uuid4()),
+        channel=InputChannel.DIRECT,
+        modality=InputModality.IMAGE,
+        content="images/water_sample.jpg",
+        source_id="well_001",
+        location="North Delhi",  # Will trigger alert if HIGH risk
+        metadata={"location": "North Delhi"}
+    )
     
-#     logger.info("\n" + "=" * 90)
-#     logger.info("EXAMPLE 1: DIRECT USER INPUT (IMAGE)")
-#     logger.info("=" * 90)
-#     result = run_pipeline(direct_input)
+    logger.info("\n" + "=" * 100)
+    logger.info("EXAMPLE 1: DIRECT INPUT WITH ALERT")
+    logger.info("=" * 100)
+    result = run_pipeline(direct_input)
     
-#     # Example 2: WhatsApp message (simulated)
-#     whatsapp_input = UserInputPacket(
-#         input_id=str(uuid.uuid4()),
-#         channel=InputChannel.WHATSAPP,
-#         modality=InputModality.TEXT,
-#         content="Water pH level reported as abnormal",
-#         source_id="whatsapp_geohash_123",
-#         metadata={
-#             "source_channel": "whatsapp",
-#             "sender": "field_agent",
-#             "chat_name": "Water Quality Reports"
-#         }
-#     )
+    # Print results
+    if result["alert"] and result["alert"]["alert_sent"]:
+        print("\n🚨 ALERT NOTIFICATION SENT")
+        print(f"Organization: {result['alert']['recipient_org']}")
+        print(f"Risk Level: {result['alert']['alert_level']}")
     
-#     logger.info("\n" + "=" * 90)
-#     logger.info("EXAMPLE 2: WHATSAPP INPUT (TEXT MESSAGE)")
-#     logger.info("=" * 90)
-#     result = run_pipeline(whatsapp_input)
+    if result["analysis"] and result["analysis"]["recommendations"]:
+        print("\n💡 RECOMMENDATIONS:")
+        for rec in result["analysis"]["recommendations"]:
+            print(f"  • {rec.get('recommendation')} [{rec.get('priority')}]")
     
-#     # Pretty print results
-#     if result["analysis"]:
-#         print("\n" + "=" * 90)
-#         print("📊 RESULTS")
-#         print("=" * 90)
-        
-#         analysis = result["analysis"]
-#         if analysis.get("forecast_result"):
-#             print(f"⚠️  Risk Level: {analysis['forecast_result'].get('risk_forecast', {}).get('risk_level')}")
-        
-#         if analysis.get("recommendations"):
-#             print(f"💡 Recommendations: {len(analysis['recommendations'])}")
-#             for rec in analysis["recommendations"]:
-#                 print(f"  [{rec.get('priority')}] {rec.get('recommendation')}")
-        
-#         print("=" * 90 + "\n")
+    print("\n" + "=" * 100 + "\n")

@@ -1,5 +1,5 @@
 import asyncio
-from backend.services.smtp_service import get_smtp_service
+from smtp_service import get_smtp_service
 
 async def main():
     smtp = get_smtp_service()
@@ -13,3 +13,4 @@ async def main():
     print("EMAIL SENT:", ok)
 
 asyncio.run(main())
+

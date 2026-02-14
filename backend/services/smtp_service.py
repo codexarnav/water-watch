@@ -3,7 +3,7 @@ import aiosmtplib
 from email.mime.text import MIMEText
 from email.mime.multipart import MIMEMultipart
 
-from backend.config import settings
+from config import settings
 
 logger = logging.getLogger(__name__)
 

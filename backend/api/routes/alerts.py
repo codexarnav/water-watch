@@ -1,6 +1,6 @@
 from fastapi import APIRouter, HTTPException
-from backend.schemas import AlertRequest
-from backend.alerts.alert_router import route_alert
+from schemas import AlertRequest
+from alerts.alert_router import route_alert
 
 router = APIRouter(prefix="/alerts", tags=["alerts"])
 

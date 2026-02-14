@@ -15,10 +15,10 @@ This file contains NO infrastructure logic.
 from typing import Dict, List
 import hashlib
 
-from backend.services.smtp_service import get_smtp_service
-from backend.services.redis_throttle import get_redis_client
-from backend.services.trust_service import get_trust_service
-from backend.services.audit_logger import get_audit_logger
+from services.smtp_service import get_smtp_service
+from services.redis_throttle import get_redis_client
+from services.trust_service import get_trust_service
+from services.audit_logger import get_audit_logger
 
 # --------------------------------------------------
 # Service Singletons

@@ -1,6 +1,6 @@
 import smtplib
 from email.message import EmailMessage
-from backend.config import settings
+from config import settings
 
 def test_smtp():
     msg = EmailMessage()
